@@ -402,6 +402,8 @@ def prepare_monitoring_tasks() -> List[Dict[str, Any]]:
 def prepare_monitoring_tasks_for(target_configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Similar to prepare_monitoring_tasks(), but only for the given subset of target configs.
+
+    Note: this also persists `date_id_cache.json` if it had to fetch any uncached mappings.
     """
     print(f"--- Preparing monitoring tasks for selected venues ---")
     all_tasks = []
@@ -409,12 +411,24 @@ def prepare_monitoring_tasks_for(target_configs: List[Dict[str, Any]]) -> List[D
     today = _today_str()
     cache = load_date_id_cache()
 
+    cache_changed = False
+
+    def _cache_snapshot_for(cfg: Dict[str, Any]) -> Tuple[Any, Any]:
+        venue_id = cfg.get("venueId")
+        entry = cache.get("by_venue", {}).get(venue_id, {}) if venue_id else {}
+        return (entry.get("fieldType"), entry.get("date_id_map"))
+
     for cfg in target_configs:
         try:
             print(f"--- Preparing: {cfg['name']} ---")
             field_type = cfg["fieldType"]
 
+            before = _cache_snapshot_for(cfg)
             date_id_map = get_or_refresh_date_id_map(cfg, cache, today)
+            after = _cache_snapshot_for(cfg)
+            if after != before:
+                cache_changed = True
+
             if not date_id_map:
                 print(f"  Could not fetch any dates for {cfg['name']}")
                 continue
@@ -432,6 +446,15 @@ def prepare_monitoring_tasks_for(target_configs: List[Dict[str, Any]]) -> List[D
                 all_tasks.append(task)
         except Exception as e:
             print(f"  Failed to prepare tasks for {cfg['name']}: {e}")
+
+    if cache_changed:
+        try:
+            cache["cache_date"] = today
+            cache["last_written_at"] = datetime.now().isoformat(timespec="seconds")
+            save_date_id_cache(cache)
+            print(f"--- Wrote dateId cache: {DATE_ID_CACHE_PATH} ---")
+        except Exception as e:
+            print(f"[{datetime.now()}] Warning: failed to write dateId cache: {e}")
 
     print(f"--- Preparation complete. Found {len(all_tasks)} total date/venue combinations to monitor. ---")
     return all_tasks
@@ -459,9 +482,14 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
     while True:
         cycle_no += 1
         cycle_started_at = datetime.now()
+
+        # Expire availability from previous cycle so AVAILABLE NOW only shows fresh data
+        available_now = []
+        last_avail_sig = tuple()
+
         try:
             all_slots_for_cycle: List[Dict[str, Any]] = []
-
+            
             _render_status_panel(
                 cycle_started_at=cycle_started_at,
                 cycle_no=cycle_no,

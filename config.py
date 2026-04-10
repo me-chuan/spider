@@ -30,7 +30,7 @@ TARGET_CONFIGS = [
         "fieldType":"b3dce013-3a0e-45e0-a0c2-425a364ac90f",
     },
     {
-        "name": "Huoyingdong Badminton Gym",
+        "name": "Huoyingdong Badminton Court",
         "type": "Badminton",
         "venueId":"9096787a-bc53-430a-9405-57dc46bc9e83",
         "fieldType":"49629b20-71fb-4bae-8675-fdae0831e861",
