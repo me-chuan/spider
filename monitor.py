@@ -32,6 +32,7 @@ def _render_status_panel(
     last_change_at: datetime | None,
     sleep_left: int | None,
     recent_lines: List[str] | None = None,
+    error_lines: List[str] | None = None,
     alert_banner: str | None = None,
 ) -> None:
     """Render a compact always-on-top status view."""
@@ -78,6 +79,16 @@ def _render_status_panel(
         print("-----------")
         for line in recent_lines[-25:]:
             print(line)
+
+    # Persistent error area so important problems (like expired cookies)
+    # are not immediately cleared by UI refreshes.
+    print("\nERRORS")
+    print("------")
+    if error_lines:
+        for line in error_lines[-10:]:
+            print(line)
+    else:
+        print("(none)")
 
 
 def _availability_signature(slots: List[Dict[str, Any]]) -> Tuple[Tuple[str, str, str, str], ...]:
@@ -465,6 +476,9 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
     last_avail_sig: Tuple[Tuple[str, str, str, str], ...] = tuple()
     last_change_at: datetime | None = None
 
+    # Persistent error log across refreshes
+    error_lines: List[str] = []
+
     # Alert state (sticky for a short time after detection)
     alert_until_ts: float = 0.0
     last_alert_sig: Tuple[Tuple[str, str, str, str], ...] = tuple()
@@ -505,6 +519,7 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                 last_change_at=last_change_at,
                 sleep_left=None,
                 recent_lines=None,
+                error_lines=error_lines,
                 alert_banner=banner,
             )
 
@@ -525,6 +540,7 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                         last_change_at=last_change_at,
                         sleep_left=None,
                         recent_lines=recent_lines,
+                        error_lines=error_lines,
                         alert_banner=banner,
                     )
 
@@ -562,7 +578,11 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                         else:
                             recent_lines.append(f"[{datetime.now():%H:%M:%S}] No availability.")
                     else:
-                        recent_lines.append(f"[{datetime.now():%H:%M:%S}] Unexpected Content-Type: {content_type}")
+                        msg = f"[{datetime.now():%H:%M:%S}] Unexpected Content-Type: {content_type}"
+                        recent_lines.append(msg)
+                        error_lines.append(msg)
+                        if len(error_lines) > 100:
+                            del error_lines[:-100]
 
                     banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
                     _render_status_panel(
@@ -574,13 +594,18 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                         last_change_at=last_change_at,
                         sleep_left=None,
                         recent_lines=recent_lines,
+                        error_lines=error_lines,
                         alert_banner=banner,
                     )
 
                     time.sleep(CHECK_INTERVAL)
 
                 except Exception as e:
-                    recent_lines.append(f"[{datetime.now():%H:%M:%S}] Error: {e}")
+                    msg = f"[{datetime.now():%H:%M:%S}] Error: {e}"
+                    recent_lines.append(msg)
+                    error_lines.append(msg)
+                    if len(error_lines) > 100:
+                        del error_lines[:-100]
                     banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
                     _render_status_panel(
                         cycle_started_at=cycle_started_at,
@@ -591,6 +616,7 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                         last_change_at=last_change_at,
                         sleep_left=None,
                         recent_lines=recent_lines,
+                        error_lines=error_lines,
                         alert_banner=banner,
                     )
                     time.sleep(1)
@@ -611,7 +637,11 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                 last_seen.add(key)
 
         except Exception as e:
-            outer_recent_lines = [f"[{datetime.now():%H:%M:%S}] Cycle error: {e}"]
+            msg = f"[{datetime.now():%H:%M:%S}] Cycle error: {e}"
+            outer_recent_lines = [msg]
+            error_lines.append(msg)
+            if len(error_lines) > 100:
+                del error_lines[:-100]
             banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
             _render_status_panel(
                 cycle_started_at=cycle_started_at,
@@ -622,24 +652,27 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                 last_change_at=last_change_at,
                 sleep_left=None,
                 recent_lines=outer_recent_lines,
+                error_lines=error_lines,
                 alert_banner=banner,
             )
             time.sleep(1)
 
-        for left in range(POLL_INTERVAL, 0, -1):
-            banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
-            _render_status_panel(
-                cycle_started_at=cycle_started_at,
-                cycle_no=cycle_no,
-                total_checks=len(monitoring_tasks),
-                current_check=None,
-                available_now=available_now,
-                last_change_at=last_change_at,
-                sleep_left=left,
-                recent_lines=outer_recent_lines,
-                alert_banner=banner,
-            )
-            time.sleep(1)
+        # 在等待下一次轮询时，为了减少后台占用，我们不再每秒刷新 TUI，
+        # 而是渲染一次状态面板然后整体 sleep POLL_INTERVAL 秒。
+        banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
+        _render_status_panel(
+            cycle_started_at=cycle_started_at,
+            cycle_no=cycle_no,
+            total_checks=len(monitoring_tasks),
+            current_check=None,
+            available_now=available_now,
+            last_change_at=last_change_at,
+            sleep_left=POLL_INTERVAL,
+            recent_lines=outer_recent_lines,
+            error_lines=error_lines,
+            alert_banner=banner,
+        )
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
