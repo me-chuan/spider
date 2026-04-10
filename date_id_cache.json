@@ -29,10 +29,54 @@
       "fieldType": "4dd7ae28-cf27-4369-9bc4-ee75b8e3cc76",
       "name": "Eastern district tennis court",
       "refreshed_at": "2026-04-10T15:37:28"
+    },
+    "768214ba-3b1c-4f29-ad00-15c0e376b000": {
+      "date_id_map": {
+        "2026-04-10": "WbFUbRcCoHgMCMO5w8soXfWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-11": "cZK5e7km2NKy25ZFab/AOvWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-12": "nmPKhee14w2QnNj/eoMPRvWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-13": "0+7IwUAfANR7a/irr4KkAfWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-14": "F9Shhp52iDqI5QraUGQ5xfWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-15": "fC/tzZgSf35La7gChCJ5+/WbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-16": "R7gZfG/Cj0ZxxqZSPPc16/WbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-17": "Dy2+RaJwzezpHxild4eX2/WbfNcMzkEVV6IjUkNmkno="
+      },
+      "fieldType": "0a349309-1734-4507-98bd-4c30bf33c6bc",
+      "name": "Zijin Street Gym",
+      "refreshed_at": "2026-04-10T17:12:38"
+    },
+    "9096787a-bc53-430a-9405-57dc46bc9e83": {
+      "date_id_map": {
+        "2026-04-10": "WbFUbRcCoHgMCMO5w8soXfWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-11": "cZK5e7km2NKy25ZFab/AOvWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-12": "nmPKhee14w2QnNj/eoMPRvWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-13": "0+7IwUAfANR7a/irr4KkAfWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-14": "F9Shhp52iDqI5QraUGQ5xfWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-15": "fC/tzZgSf35La7gChCJ5+/WbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-16": "R7gZfG/Cj0ZxxqZSPPc16/WbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-17": "Dy2+RaJwzezpHxild4eX2/WbfNcMzkEVV6IjUkNmkno="
+      },
+      "fieldType": "b3dce013-3a0e-45e0-a0c2-425a364ac90f",
+      "name": "Huoyingdong Gym",
+      "refreshed_at": "2026-04-10T17:12:38"
+    },
+    "d784ad7c-cb24-4282-afd6-a67aec68c675": {
+      "date_id_map": {
+        "2026-04-10": "WbFUbRcCoHgMCMO5w8soXfWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-11": "cZK5e7km2NKy25ZFab/AOvWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-12": "nmPKhee14w2QnNj/eoMPRvWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-13": "0+7IwUAfANR7a/irr4KkAfWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-14": "F9Shhp52iDqI5QraUGQ5xfWbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-15": "fC/tzZgSf35La7gChCJ5+/WbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-16": "R7gZfG/Cj0ZxxqZSPPc16/WbfNcMzkEVV6IjUkNmkno=",
+        "2026-04-17": "Dy2+RaJwzezpHxild4eX2/WbfNcMzkEVV6IjUkNmkno="
+      },
+      "fieldType": "7d46c0a4-3ae6-4398-822b-d4b7b37085fa",
+      "name": "Student Center Gym",
+      "refreshed_at": "2026-04-10T17:12:38"
     }
-
   },
   "cache_date": "2026-04-10",
-  "last_written_at": "2026-04-10T16:20:44",
+  "last_written_at": "2026-04-10T17:12:38",
   "version": 1
 }

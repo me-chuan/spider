@@ -14,6 +14,14 @@ def _clear_screen() -> None:
     print("\033[2J\033[H", end="")
 
 
+def _terminal_bell(repeat: int = 1, interval: float = 0.15) -> None:
+    """Emit an audible/visible terminal bell (best-effort)."""
+    for i in range(max(1, repeat)):
+        print("\a", end="", flush=True)
+        if i != repeat - 1:
+            time.sleep(interval)
+
+
 def _render_status_panel(
     *,
     cycle_started_at: datetime,
@@ -24,6 +32,7 @@ def _render_status_panel(
     last_change_at: datetime | None,
     sleep_left: int | None,
     recent_lines: List[str] | None = None,
+    alert_banner: str | None = None,
 ) -> None:
     """Render a compact always-on-top status view."""
     _clear_screen()
@@ -32,6 +41,10 @@ def _render_status_panel(
     header = f"SJTU Venue Monitor | now={now:%Y-%m-%d %H:%M:%S} | cycle={cycle_no} | checks={total_checks}"
     print(header)
     print("=" * len(header))
+
+    if alert_banner:
+        # Inverse video + bold (best-effort ANSI)
+        print(f"\n\033[1;7m {alert_banner} \033[0m\n")
 
     if current_check:
         print(f"Checking: {current_check}")
@@ -87,6 +100,7 @@ VENUE_API_URL = "https://sports.sjtu.edu.cn/manage/fieldDetail/queryFieldSituati
 
 # How often to check (seconds)
 POLL_INTERVAL = 100
+CHECK_INTERVAL = 1
 
 # Time mapping for the 15 slots (07:00-08:00 to 21:00-22:00)
 TIME_SLOTS = [f"{h:02d}:00-{h+1:02d}:00" for h in range(7, 22)]
@@ -273,50 +287,22 @@ def filter_slots(slots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return filtered
 
 
-# ========= 5. NOTIFICATION (simple for now) =========
-
-def format_all_slots(slots: List[Dict[str, Any]]) -> str:
-    """
-    Format ALL slots grouped by venue, listing each slot index, count, price, status.
-    """
-    # Group by venue
-    by_venue: Dict[str, List[Dict[str, Any]]] = {}
-    for s in slots:
-        by_venue.setdefault(s["venue"], []).append(s)
-
-    lines: List[str] = []
-    for venue, v_slots in by_venue.items():
-        lines.append(f"Venue: {venue}")
-        # sort by slot_index
-        v_slots = sorted(v_slots, key=lambda x: x["slot_index"])
-        for s in v_slots:
-            idx = s["slot_index"]
-            count = s["count"]
-            price = s["price"]
-            status = s["status"]
-            time_str = s["time"]
-            flag = "AVAILABLE" if count == 1 else ""
-            lines.append(f"  {time_str}: count={count}, price={price}, status={status} {flag}")
-        lines.append("")  # blank line between venues
+def _format_available_pairs(slots: List[Dict[str, Any]], limit: int = 12) -> str:
+    pairs = sorted({(s.get("top_venue_name", "?"), s.get("date", "?")) for s in slots})
+    if not pairs:
+        return "(none)"
+    head = pairs[:limit]
+    more = len(pairs) - len(head)
+    lines = [f"{court} | {date}" for court, date in head]
+    if more > 0:
+        lines.append(f"...and {more} more")
     return "\n".join(lines)
 
 
-def format_available_slots(slots: List[Dict[str, Any]]) -> str:
-    """Format only court + date (notification)."""
-    if not slots:
-        return "No available slots."
-
-    pairs = sorted({(s.get("top_venue_name", "?"), s.get("date", "?")) for s in slots})
-    return "\n".join([f"{court} | {date}" for court, date in pairs])
-
-
-def notify(slots: List[Dict[str, Any]]) -> None:
-    """
-    For now, just print to stdout (only the newly found available slots).
-    """
-    print("=== NEWLY AVAILABLE SLOTS ===")
-    print(format_available_slots(slots))
-    print("=============================")
+def _build_alert_banner(slots: List[Dict[str, Any]]) -> str:
+    # Keep banner readable in terminal: short title + first few pairs.
+    body = _format_available_pairs(slots, limit=4)
+    return "SPARE VENUES FOUND!\n" + body
 
 
 # ========= 6. PREPARE TASKS =========
@@ -464,11 +450,11 @@ def prepare_monitoring_tasks_for(target_configs: List[Dict[str, Any]]) -> List[D
 
 def main_loop(target_configs: List[Dict[str, Any]] | None = None):
     cycle_no = 0
-    print(f"[{datetime.now()}] Starting venue monitor...")
 
     # Prepare all tasks once at the start.
     monitoring_tasks = prepare_monitoring_tasks() if target_configs is None else prepare_monitoring_tasks_for(target_configs)
     if not monitoring_tasks:
+        # With the TUI, we still surface this via stdout because we cannot render a panel without tasks.
         print("No tasks to monitor. Exiting.")
         return
 
@@ -479,6 +465,22 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
     last_avail_sig: Tuple[Tuple[str, str, str, str], ...] = tuple()
     last_change_at: datetime | None = None
 
+    # Alert state (sticky for a short time after detection)
+    alert_until_ts: float = 0.0
+    last_alert_sig: Tuple[Tuple[str, str, str, str], ...] = tuple()
+
+    def _maybe_alert(current_available: List[Dict[str, Any]]) -> None:
+        """Best-effort immediate alert when we first observe availability."""
+        nonlocal alert_until_ts, last_alert_sig
+        if not current_available:
+            return
+        sig = _availability_signature(current_available)
+        if sig == last_alert_sig:
+            return
+        last_alert_sig = sig
+        alert_until_ts = time.time() + 25
+        _terminal_bell(repeat=2)
+
     while True:
         cycle_no += 1
         cycle_started_at = datetime.now()
@@ -487,9 +489,13 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
         available_now = []
         last_avail_sig = tuple()
 
+        # Track a panel message for outer-loop failures
+        outer_recent_lines: List[str] | None = None
+
         try:
             all_slots_for_cycle: List[Dict[str, Any]] = []
-            
+
+            banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
             _render_status_panel(
                 cycle_started_at=cycle_started_at,
                 cycle_no=cycle_no,
@@ -499,14 +505,17 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                 last_change_at=last_change_at,
                 sleep_left=None,
                 recent_lines=None,
+                alert_banner=banner,
             )
 
             for idx, task in enumerate(monitoring_tasks, start=1):
-                recent_lines: List[str] = []  # reset per task (so it gets wiped after the date finishes)
+                recent_lines: List[str] = []
+                current_label = f"{idx}/{len(monitoring_tasks)} {task['top_venue_name']} on {task['target_date']}"
+
                 try:
-                    current_label = f"{idx}/{len(monitoring_tasks)} {task['top_venue_name']} on {task['target_date']}"
                     recent_lines.append(f"[{datetime.now():%H:%M:%S}] Fetching...")
 
+                    banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
                     _render_status_panel(
                         cycle_started_at=cycle_started_at,
                         cycle_no=cycle_no,
@@ -516,6 +525,7 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                         last_change_at=last_change_at,
                         sleep_left=None,
                         recent_lines=recent_lines,
+                        alert_banner=banner,
                     )
 
                     resp = fetch_raw_response(task["payload"])
@@ -546,11 +556,15 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                                 last_avail_sig = sig_now
                                 last_change_at = datetime.now()
 
+                            # Immediate alert as soon as we observe availability (no need to wait for full cycle).
+                            _maybe_alert(available_now)
+
                         else:
                             recent_lines.append(f"[{datetime.now():%H:%M:%S}] No availability.")
                     else:
                         recent_lines.append(f"[{datetime.now():%H:%M:%S}] Unexpected Content-Type: {content_type}")
 
+                    banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
                     _render_status_panel(
                         cycle_started_at=cycle_started_at,
                         cycle_no=cycle_no,
@@ -560,12 +574,14 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                         last_change_at=last_change_at,
                         sleep_left=None,
                         recent_lines=recent_lines,
+                        alert_banner=banner,
                     )
 
-                    time.sleep(2)
+                    time.sleep(CHECK_INTERVAL)
 
                 except Exception as e:
                     recent_lines.append(f"[{datetime.now():%H:%M:%S}] Error: {e}")
+                    banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
                     _render_status_panel(
                         cycle_started_at=cycle_started_at,
                         cycle_no=cycle_no,
@@ -575,29 +591,43 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                         last_change_at=last_change_at,
                         sleep_left=None,
                         recent_lines=recent_lines,
+                        alert_banner=banner,
                     )
                     time.sleep(1)
 
+            # End-of-cycle aggregation still updates the panel state,
+            # but alerts would have already been triggered above.
             now_available = filter_slots(all_slots_for_cycle)
             sig = _availability_signature(now_available)
+
             if sig != last_avail_sig:
                 last_avail_sig = sig
                 available_now = now_available
                 last_change_at = datetime.now()
 
-            new_slots: List[Dict[str, Any]] = []
+            # Keep a "seen" set so the project can re-introduce alerts later if desired.
             for s in now_available:
                 key = (s["top_venue_name"], s["venue"], s["date"], s["time"])
-                if key not in last_seen:
-                    last_seen.add(key)
-                    new_slots.append(s)
-            if new_slots:
-                notify(new_slots)
+                last_seen.add(key)
 
-        except Exception:
-            pass
+        except Exception as e:
+            outer_recent_lines = [f"[{datetime.now():%H:%M:%S}] Cycle error: {e}"]
+            banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
+            _render_status_panel(
+                cycle_started_at=cycle_started_at,
+                cycle_no=cycle_no,
+                total_checks=len(monitoring_tasks),
+                current_check=None,
+                available_now=available_now,
+                last_change_at=last_change_at,
+                sleep_left=None,
+                recent_lines=outer_recent_lines,
+                alert_banner=banner,
+            )
+            time.sleep(1)
 
         for left in range(POLL_INTERVAL, 0, -1):
+            banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
             _render_status_panel(
                 cycle_started_at=cycle_started_at,
                 cycle_no=cycle_no,
@@ -606,7 +636,8 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                 available_now=available_now,
                 last_change_at=last_change_at,
                 sleep_left=left,
-                recent_lines=None,
+                recent_lines=outer_recent_lines,
+                alert_banner=banner,
             )
             time.sleep(1)
 
