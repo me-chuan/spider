@@ -10,12 +10,29 @@ from typing import List, Dict, Any, Tuple
 VENUE_API_URL = "https://sports.sjtu.edu.cn/manage/fieldDetail/queryFieldSituation"
 
 
-POST_PAYLOAD = {
-    "fieldType": "19f69e5c-872f-4fbb-b9fe-70d6337c2d93",  # 网球
-    "date": "2026-04-12",  # target date
-    "venueId": "0c6edc93-87ac-41b0-9895-6b66fda93fe5",   # this specific tennis venue
-    "dateId": "0drGPm8tcFtAKjfJ+Qa7wnIwRs0YPXAUTXlyWzHam4Y=",  # opaque, copied as-is
-}
+TARGET_CONFIGS = [
+    {
+        "name": "Huxiaoming tennis court",
+        "venue_id": "0c6edc93-87ac-41b0-9895-6b66fda93fe5",
+        "payload": {
+            "fieldType": "19f69e5c-872f-4fbb-b9fe-70d6337c2d93",  # 网球
+            "date": "2026-04-12",  # target date
+            "venueId": "0c6edc93-87ac-41b0-9895-6b66fda93fe5",   # this specific tennis venue
+            "dateId": "0drGPm8tcFtAKjfJ+Qa7wnIwRs0YPXAUTXlyWzHam4Y=",  # opaque, copied as-is
+        }
+    },
+    {
+        "name": "Eastern district tennis court",
+        "venue_id": "3466293b-a7d8-45be-a918-8526e3bed4c5",
+        "payload": {
+            "fieldType":"4dd7ae28-cf27-4369-9bc4-ee75b8e3cc76",
+            "date":"2026-04-12",
+            "venueId":"3466293b-a7d8-45be-a918-8526e3bed4c5",
+            "dateId":"0drGPm8tcFtAKjfJ+Qa7wod3a2NI40C2dHZQsT4sZHo="
+        }
+    }
+]
+
 
 # Headers copied from your browser for that request
 HEADERS = {
@@ -29,9 +46,9 @@ HEADERS = {
 
 # Cookies copied from your logged-in browser
 COOKIES = {
-    "_ga_VGHWLGCC9B": "GS2.1.s1753965580$o1$g1$t1753965998$j56$l0$h0",
     "_ga": "GA1.1.1974817216.1753965581",
-    "JSESSIONID": "3d3e45c8-7e8d-458d-b074-59913be32048",
+    "_ga_VGHWLGCC9B": "GS2.1.s1753965580$o1$g1$t1753965998$j56$l0$h0",
+    "JSESSIONID": "f137098e-0b96-4909-8dea-ef90dfb35e2f"
 }
 
 # How often to check (seconds)
@@ -47,13 +64,13 @@ INTERESTING_HOURS = []   # e.g. ["19:00", "20:00"]
 
 # ========= 2. FETCHING =========
 
-def fetch_raw_response() -> requests.Response:
+def fetch_raw_response(payload: Dict[str, Any]) -> requests.Response:
     """Perform the HTTP POST to the venue API/page."""
     resp = requests.post(
         VENUE_API_URL,
         headers=HEADERS,
         cookies=COOKIES,
-        json=POST_PAYLOAD,
+        json=payload,
         timeout=15,
     )
     resp.raise_for_status()
@@ -160,8 +177,10 @@ def format_available_slots(slots: List[Dict[str, Any]]) -> str:
 
     lines = []
     for s in slots:
+        #print(s)
         lines.append(
-            f'{s["venue"]} @ {s["time"]} (count={s["count"]}, price={s["price"]}, status={s["status"]})'
+            f'Court={s["top_venue_name"]} {s["time"]} '
+            f'(count={s["count"]}, price={s["price"]}, status={s["status"]})'
         )
     return "\n".join(lines)
 
@@ -183,24 +202,29 @@ def main_loop():
 
     while True:
         try:
-            resp = fetch_raw_response()
+            all_slots_for_cycle = []
+            print(f"\n[{datetime.now()}] --- STARTING NEW POLL CYCLE ---")
 
-            # Decide JSON vs HTML
-            content_type = resp.headers.get("Content-Type", "")
-            if "application/json" in content_type:
-                data = resp.json()
-                all_slots = parse_slots_from_json(data)
-                print(f"\n[{datetime.now()}] --- FULL PRICE LIST SNAPSHOT ---")
-                print(format_all_slots(all_slots))
-            else:
-                # If HTML, uncomment the HTML parser above
-                # all_slots = parse_slots_from_html(resp.text)
-                print(f"Unexpected Content-Type: {content_type}")
-                all_slots = []
-                # For debugging:
-                # print(resp.text[:1000])
+            for config in TARGET_CONFIGS:
+                print(f"--- Checking: {config['name']} ---")
+                resp = fetch_raw_response(config["payload"])
 
-            interesting_and_available = filter_slots(all_slots)
+                # Decide JSON vs HTML
+                content_type = resp.headers.get("Content-Type", "")
+                if "application/json" in content_type:
+                    data = resp.json()
+                    all_slots = parse_slots_from_json(data)
+
+                    for s in all_slots:
+                        s["top_venue_name"] = config["name"]
+                        s["top_venue_id"] = config["venue_id"]
+
+                    all_slots_for_cycle.extend(all_slots)
+                    print(format_all_slots(all_slots))
+                else:
+                    print(f"Unexpected Content-Type for {config['name']}: {content_type}")
+
+            interesting_and_available = filter_slots(all_slots_for_cycle)
 
             # Deduplicate by (venue, time) across runs so you don’t get spam
             new_slots: List[Dict[str, Any]] = []
