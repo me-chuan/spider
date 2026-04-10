@@ -2,70 +2,203 @@ import requests
 import time
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
-# from bs4 import BeautifulSoup  # uncomment if you need HTML parsing
+import json
+import os
 
-# ========= 1. CONFIG – YOU FILL THESE IN =========
+from config import TARGET_CONFIGS, HEADERS, COOKIES
 
-# URL that returns the venue/slot data (from DevTools → Network)
+# ========= terminal UI helpers =========
+
+def _clear_screen() -> None:
+    # ANSI clear screen + cursor home
+    print("\033[2J\033[H", end="")
+
+
+def _render_status_panel(
+    *,
+    cycle_started_at: datetime,
+    cycle_no: int,
+    total_checks: int,
+    current_check: str | None,
+    available_now: List[Dict[str, Any]],
+    last_change_at: datetime | None,
+    sleep_left: int | None,
+    recent_lines: List[str] | None = None,
+) -> None:
+    """Render a compact always-on-top status view."""
+    _clear_screen()
+
+    now = datetime.now()
+    header = f"SJTU Venue Monitor | now={now:%Y-%m-%d %H:%M:%S} | cycle={cycle_no} | checks={total_checks}"
+    print(header)
+    print("=" * len(header))
+
+    if current_check:
+        print(f"Checking: {current_check}")
+    else:
+        print("Checking: (idle)")
+
+    if last_change_at:
+        print(f"Last availability change: {last_change_at:%Y-%m-%d %H:%M:%S}")
+    else:
+        print("Last availability change: (none)")
+
+    if sleep_left is not None:
+        print(f"Next poll in: {sleep_left}s")
+    else:
+        print("Next poll in: (running)")
+
+    print("\nAVAILABLE NOW (court + date)")
+    print("---------------------------")
+
+    pairs = sorted({(s.get("top_venue_name", "?"), s.get("date", "?")) for s in available_now})
+    if not pairs:
+        print("(none)")
+    else:
+        for court, date in pairs[:200]:
+            print(f"- {court} | {date}")
+        if len(pairs) > 200:
+            print(f"... and {len(pairs) - 200} more")
+
+    if recent_lines:
+        print("\nTASK OUTPUT")
+        print("-----------")
+        for line in recent_lines[-25:]:
+            print(line)
+
+
+def _availability_signature(slots: List[Dict[str, Any]]) -> Tuple[Tuple[str, str, str, str], ...]:
+    """Stable signature for 'currently available' list."""
+    keys = []
+    for s in slots:
+        keys.append((
+            str(s.get("top_venue_name")),
+            str(s.get("venue")),
+            str(s.get("date")),
+            str(s.get("time")),
+        ))
+    return tuple(sorted(set(keys)))
+
+# ========= 1. CONSTANTS / ENDPOINTS =========
+
+VENUE_DETAIL_URL = "https://sports.sjtu.edu.cn/manage/venue/queryVenueById"
+DATE_ID_URL = "https://sports.sjtu.edu.cn/manage/fieldDetail/queryFieldReserveSituationIsFull"
 VENUE_API_URL = "https://sports.sjtu.edu.cn/manage/fieldDetail/queryFieldSituation"
 
-
-TARGET_CONFIGS = [
-    {
-        "name": "Huxiaoming tennis court",
-        "venue_id": "0c6edc93-87ac-41b0-9895-6b66fda93fe5",
-        "payload": {
-            "fieldType": "19f69e5c-872f-4fbb-b9fe-70d6337c2d93",  # 网球
-            "date": "2026-04-12",  # target date
-            "venueId": "0c6edc93-87ac-41b0-9895-6b66fda93fe5",   # this specific tennis venue
-            "dateId": "0drGPm8tcFtAKjfJ+Qa7wnIwRs0YPXAUTXlyWzHam4Y=",  # opaque, copied as-is
-        }
-    },
-    {
-        "name": "Eastern district tennis court",
-        "venue_id": "3466293b-a7d8-45be-a918-8526e3bed4c5",
-        "payload": {
-            "fieldType":"4dd7ae28-cf27-4369-9bc4-ee75b8e3cc76",
-            "date":"2026-04-12",
-            "venueId":"3466293b-a7d8-45be-a918-8526e3bed4c5",
-            "dateId":"0drGPm8tcFtAKjfJ+Qa7wod3a2NI40C2dHZQsT4sZHo="
-        }
-    }
-]
-
-
-# Headers copied from your browser for that request
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
-    "Content-Type": "application/json;charset=utf-8",
-    "Origin": "https://sports.sjtu.edu.cn",
-    "Referer": "https://sports.sjtu.edu.cn/pc/",
-}
-
-# Cookies copied from your logged-in browser
-COOKIES = {
-    "_ga": "GA1.1.1974817216.1753965581",
-    "_ga_VGHWLGCC9B": "GS2.1.s1753965580$o1$g1$t1753965998$j56$l0$h0",
-    "JSESSIONID": "f137098e-0b96-4909-8dea-ef90dfb35e2f"
-}
-
 # How often to check (seconds)
-POLL_INTERVAL = 60
+POLL_INTERVAL = 100
 
 # Time mapping for the 15 slots (07:00-08:00 to 21:00-22:00)
 TIME_SLOTS = [f"{h:02d}:00-{h+1:02d}:00" for h in range(7, 22)]
 
 # Optional simple filter: only these venues/times are interesting
-INTERESTING_VENUES = []  # e.g. ["Main Gym", "Court 1"]
-INTERESTING_HOURS = []   # e.g. ["19:00", "20:00"]
+INTERESTING_VENUES: List[str] = []  # top-level venue names
+INTERESTING_HOURS: List[str] = []   # e.g. ["19:00-20:00"]
+
+# Persistent cache for dateId refresh (1 refresh per day)
+DATE_ID_CACHE_PATH = os.path.join(os.path.dirname(__file__), "date_id_cache.json")
 
 
-# ========= 2. FETCHING =========
+def _today_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def load_date_id_cache() -> Dict[str, Any]:
+    """Load cache JSON from disk. Returns a normalized dict."""
+    try:
+        if not os.path.exists(DATE_ID_CACHE_PATH):
+            return {"cache_date": None, "version": 1, "by_venue": {}}
+        with open(DATE_ID_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"cache_date": None, "version": 1, "by_venue": {}}
+        data.setdefault("cache_date", None)
+        data.setdefault("version", 1)
+        data.setdefault("by_venue", {})
+        if not isinstance(data["by_venue"], dict):
+            data["by_venue"] = {}
+        return data
+    except Exception as e:
+        print(f"[{datetime.now()}] Warning: failed to load dateId cache: {e}. Will refresh.")
+        return {"cache_date": None, "version": 1, "by_venue": {}}
+
+
+def save_date_id_cache(cache: Dict[str, Any]) -> None:
+    """Atomically write cache JSON to disk."""
+    tmp = DATE_ID_CACHE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(tmp, DATE_ID_CACHE_PATH)
+
+
+def get_or_refresh_date_id_map(cfg: Dict[str, Any], cache: Dict[str, Any], today: str) -> Dict[str, str]:
+    """Return date->dateId mapping for a venue+fieldType from cache or by refreshing API."""
+    venue_id = cfg["venueId"]
+    field_type = cfg["fieldType"]
+
+    venue_entry = cache.get("by_venue", {}).get(venue_id, {})
+    cached_field_type = venue_entry.get("fieldType")
+    cached_map = venue_entry.get("date_id_map")
+
+    # Cache is valid only if it's for today AND same fieldType AND has a mapping
+    if cache.get("cache_date") == today and cached_field_type == field_type and isinstance(cached_map, dict) and cached_map:
+        return {str(k): str(v) for k, v in cached_map.items() if k and v}
+
+    # Refresh from API
+    date_id_map = fetch_date_ids(venue_id, field_type, today)
+    if date_id_map:
+        cache.setdefault("by_venue", {})
+        cache["by_venue"][venue_id] = {
+            "name": cfg.get("name"),
+            "fieldType": field_type,
+            "date_id_map": date_id_map,
+            "refreshed_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    return date_id_map
+
+
+# ========= 2. FETCHING HELPERS =========
+
+def fetch_with_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    resp = requests.post(
+        url,
+        headers=HEADERS,
+        cookies=COOKIES,
+        json=payload,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_date_ids(venue_id: str, field_type: str, base_date: str) -> Dict[str, str]:
+    """Return mapping date -> dateId for the range returned by the API, based on one date query."""
+    payload = {
+        "id": venue_id,
+        "feildType": field_type,
+        "date": base_date,
+    }
+    data = fetch_with_json(DATE_ID_URL, payload)
+    result: Dict[str, str] = {}
+    for item in data.get("data", []):
+        d = item.get("date")
+        did = item.get("dateId")
+        if d and did:
+            result[d] = did
+    return result
+
+
+def build_field_situation_payload(venue_id: str, field_type: str, date: str, date_id: str) -> Dict[str, Any]:
+    return {
+        "fieldType": field_type,
+        "date": date,
+        "venueId": venue_id,
+        "dateId": date_id,
+    }
+
 
 def fetch_raw_response(payload: Dict[str, Any]) -> requests.Response:
-    """Perform the HTTP POST to the venue API/page."""
+    """Perform the HTTP POST to the venue field situation API."""
     resp = requests.post(
         VENUE_API_URL,
         headers=HEADERS,
@@ -123,7 +256,7 @@ def parse_slots_from_json(json_data: Dict[str, Any]) -> List[Dict[str, Any]]:
 def filter_slots(slots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Apply simple filters like venue name / hours of day, if configured."""
     # First, get only available slots
-    available = [s for s in slots if s.get("count", 0) == 1]
+    available = [s for s in slots if s.get("count", 0) != 0]
 
     if not INTERESTING_VENUES and not INTERESTING_HOURS:
         return available
@@ -169,20 +302,12 @@ def format_all_slots(slots: List[Dict[str, Any]]) -> str:
 
 
 def format_available_slots(slots: List[Dict[str, Any]]) -> str:
-    """
-    Format only available slots (for notification).
-    """
+    """Format only court + date (notification)."""
     if not slots:
         return "No available slots."
 
-    lines = []
-    for s in slots:
-        #print(s)
-        lines.append(
-            f'Court={s["top_venue_name"]} {s["time"]} '
-            f'(count={s["count"]}, price={s["price"]}, status={s["status"]})'
-        )
-    return "\n".join(lines)
+    pairs = sorted({(s.get("top_venue_name", "?"), s.get("date", "?")) for s in slots})
+    return "\n".join([f"{court} | {date}" for court, date in pairs])
 
 
 def notify(slots: List[Dict[str, Any]]) -> None:
@@ -194,55 +319,268 @@ def notify(slots: List[Dict[str, Any]]) -> None:
     print("=============================")
 
 
-# ========= 6. MAIN LOOP =========
+# ========= 6. PREPARE TASKS =========
 
-def main_loop():
+def prepare_monitoring_tasks() -> List[Dict[str, Any]]:
+    """
+    Runs once to resolve all fieldTypes and dateIds, creating a list of tasks.
+    Each task is a dictionary with the payload and metadata needed for a single check.
+
+    Daily refresh optimization:
+    - On startup, if the cache file is for today, reuse cached dateId mappings.
+    - Otherwise refresh from API and write cache for today.
+
+    Cache update behavior:
+    - Even on a cache hit day, if you add new courts (venueId) or change fieldType,
+      we will fetch the missing mapping and write it back to the cache file.
+    """
+    print("--- Preparing all monitoring tasks for the day ---")
+    all_tasks = []
+
+    today = _today_str()
+    cache = load_date_id_cache()
+
+    cache_is_today = cache.get("cache_date") == today
+    if cache_is_today:
+        print(f"--- dateId cache hit for {today}. Skipping refresh. ---")
+    else:
+        print(f"--- dateId cache miss/stale. Refreshing for {today}. ---")
+        cache["cache_date"] = today
+        cache.setdefault("by_venue", {})
+
+    cache_changed = False
+
+    def _cache_snapshot_for(cfg: Dict[str, Any]) -> Tuple[Any, Any]:
+        venue_id = cfg.get("venueId")
+        entry = cache.get("by_venue", {}).get(venue_id, {}) if venue_id else {}
+        return (entry.get("fieldType"), entry.get("date_id_map"))
+
+    for cfg in TARGET_CONFIGS:
+        try:
+            print(f"--- Preparing: {cfg['name']} ---")
+            field_type = cfg["fieldType"]
+            print(f"  Using configured fieldType: {field_type}")
+
+            before = _cache_snapshot_for(cfg)
+            date_id_map = get_or_refresh_date_id_map(cfg, cache, today)
+            after = _cache_snapshot_for(cfg)
+            if after != before:
+                cache_changed = True
+
+            if not date_id_map:
+                print(f"  Could not fetch any dates for {cfg['name']}")
+                continue
+
+            print(f"  Found {len(date_id_map)} dates to check for {cfg['name']}.")
+
+            for target_date, date_id in date_id_map.items():
+                payload = build_field_situation_payload(cfg["venueId"], cfg["fieldType"], target_date, date_id)
+                task = {
+                    "top_venue_name": cfg["name"],
+                    "top_venue_id": cfg["venueId"],
+                    "target_date": target_date,
+                    "payload": payload,
+                }
+                all_tasks.append(task)
+        except Exception as e:
+            print(f"  Failed to prepare tasks for {cfg['name']}: {e}")
+
+    # If the day changed OR we fetched any new/changed venue mappings, write cache
+    if (not cache_is_today) or cache_changed:
+        try:
+            cache["cache_date"] = today
+            cache["last_written_at"] = datetime.now().isoformat(timespec="seconds")
+            save_date_id_cache(cache)
+            print(f"--- Wrote dateId cache: {DATE_ID_CACHE_PATH} ---")
+        except Exception as e:
+            print(f"[{datetime.now()}] Warning: failed to write dateId cache: {e}")
+
+    print(f"--- Preparation complete. Found {len(all_tasks)} total date/venue combinations to monitor. ---")
+    return all_tasks
+
+
+def prepare_monitoring_tasks_for(target_configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Similar to prepare_monitoring_tasks(), but only for the given subset of target configs.
+    """
+    print(f"--- Preparing monitoring tasks for selected venues ---")
+    all_tasks = []
+
+    today = _today_str()
+    cache = load_date_id_cache()
+
+    for cfg in target_configs:
+        try:
+            print(f"--- Preparing: {cfg['name']} ---")
+            field_type = cfg["fieldType"]
+
+            date_id_map = get_or_refresh_date_id_map(cfg, cache, today)
+            if not date_id_map:
+                print(f"  Could not fetch any dates for {cfg['name']}")
+                continue
+
+            print(f"  Found {len(date_id_map)} dates to check for {cfg['name']}.")
+
+            for target_date, date_id in date_id_map.items():
+                payload = build_field_situation_payload(cfg["venueId"], cfg["fieldType"], target_date, date_id)
+                task = {
+                    "top_venue_name": cfg["name"],
+                    "top_venue_id": cfg["venueId"],
+                    "target_date": target_date,
+                    "payload": payload,
+                }
+                all_tasks.append(task)
+        except Exception as e:
+            print(f"  Failed to prepare tasks for {cfg['name']}: {e}")
+
+    print(f"--- Preparation complete. Found {len(all_tasks)} total date/venue combinations to monitor. ---")
+    return all_tasks
+
+
+# ========= 7. MAIN LOOP =========
+
+def main_loop(target_configs: List[Dict[str, Any]] | None = None):
+    cycle_no = 0
     print(f"[{datetime.now()}] Starting venue monitor...")
-    last_seen: set[Tuple[str, str]] = set()  # (venue, time) to avoid duplicate spam
+
+    # Prepare all tasks once at the start.
+    monitoring_tasks = prepare_monitoring_tasks() if target_configs is None else prepare_monitoring_tasks_for(target_configs)
+    if not monitoring_tasks:
+        print("No tasks to monitor. Exiting.")
+        return
+
+    last_seen: set[Tuple[str, str]] = set()
+
+    # TUI state
+    available_now: List[Dict[str, Any]] = []
+    last_avail_sig: Tuple[Tuple[str, str, str, str], ...] = tuple()
+    last_change_at: datetime | None = None
 
     while True:
+        cycle_no += 1
+        cycle_started_at = datetime.now()
         try:
-            all_slots_for_cycle = []
-            print(f"\n[{datetime.now()}] --- STARTING NEW POLL CYCLE ---")
+            all_slots_for_cycle: List[Dict[str, Any]] = []
 
-            for config in TARGET_CONFIGS:
-                print(f"--- Checking: {config['name']} ---")
-                resp = fetch_raw_response(config["payload"])
+            _render_status_panel(
+                cycle_started_at=cycle_started_at,
+                cycle_no=cycle_no,
+                total_checks=len(monitoring_tasks),
+                current_check=None,
+                available_now=available_now,
+                last_change_at=last_change_at,
+                sleep_left=None,
+                recent_lines=None,
+            )
 
-                # Decide JSON vs HTML
-                content_type = resp.headers.get("Content-Type", "")
-                if "application/json" in content_type:
-                    data = resp.json()
-                    all_slots = parse_slots_from_json(data)
+            for idx, task in enumerate(monitoring_tasks, start=1):
+                recent_lines: List[str] = []  # reset per task (so it gets wiped after the date finishes)
+                try:
+                    current_label = f"{idx}/{len(monitoring_tasks)} {task['top_venue_name']} on {task['target_date']}"
+                    recent_lines.append(f"[{datetime.now():%H:%M:%S}] Fetching...")
 
-                    for s in all_slots:
-                        s["top_venue_name"] = config["name"]
-                        s["top_venue_id"] = config["venue_id"]
+                    _render_status_panel(
+                        cycle_started_at=cycle_started_at,
+                        cycle_no=cycle_no,
+                        total_checks=len(monitoring_tasks),
+                        current_check=current_label,
+                        available_now=available_now,
+                        last_change_at=last_change_at,
+                        sleep_left=None,
+                        recent_lines=recent_lines,
+                    )
 
-                    all_slots_for_cycle.extend(all_slots)
-                    print(format_all_slots(all_slots))
-                else:
-                    print(f"Unexpected Content-Type for {config['name']}: {content_type}")
+                    resp = fetch_raw_response(task["payload"])
 
-            interesting_and_available = filter_slots(all_slots_for_cycle)
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "application/json" in content_type:
+                        data = resp.json()
+                        slots = parse_slots_from_json(data)
 
-            # Deduplicate by (venue, time) across runs so you don’t get spam
+                        for s in slots:
+                            s["top_venue_name"] = task["top_venue_name"]
+                            s["top_venue_id"] = task["top_venue_id"]
+                            s["date"] = task["target_date"]
+
+                        all_slots_for_cycle.extend(slots)
+
+                        avail_for_task = filter_slots(slots)
+                        if avail_for_task:
+                            # Only show court + date (no venue/time details)
+                            recent_lines.append(
+                                f"[{datetime.now():%H:%M:%S}] Available: {task['top_venue_name']} | {task['target_date']}"
+                            )
+
+                            # Update AVAILABLE NOW immediately
+                            available_now.extend(avail_for_task)
+                            sig_now = _availability_signature(available_now)
+                            if sig_now != last_avail_sig:
+                                last_avail_sig = sig_now
+                                last_change_at = datetime.now()
+
+                        else:
+                            recent_lines.append(f"[{datetime.now():%H:%M:%S}] No availability.")
+                    else:
+                        recent_lines.append(f"[{datetime.now():%H:%M:%S}] Unexpected Content-Type: {content_type}")
+
+                    _render_status_panel(
+                        cycle_started_at=cycle_started_at,
+                        cycle_no=cycle_no,
+                        total_checks=len(monitoring_tasks),
+                        current_check=current_label,
+                        available_now=available_now,
+                        last_change_at=last_change_at,
+                        sleep_left=None,
+                        recent_lines=recent_lines,
+                    )
+
+                    time.sleep(2)
+
+                except Exception as e:
+                    recent_lines.append(f"[{datetime.now():%H:%M:%S}] Error: {e}")
+                    _render_status_panel(
+                        cycle_started_at=cycle_started_at,
+                        cycle_no=cycle_no,
+                        total_checks=len(monitoring_tasks),
+                        current_check=current_label,
+                        available_now=available_now,
+                        last_change_at=last_change_at,
+                        sleep_left=None,
+                        recent_lines=recent_lines,
+                    )
+                    time.sleep(1)
+
+            now_available = filter_slots(all_slots_for_cycle)
+            sig = _availability_signature(now_available)
+            if sig != last_avail_sig:
+                last_avail_sig = sig
+                available_now = now_available
+                last_change_at = datetime.now()
+
             new_slots: List[Dict[str, Any]] = []
-            for s in interesting_and_available:
-                key = (s["venue"], s["time"])
+            for s in now_available:
+                key = (s["top_venue_name"], s["venue"], s["date"], s["time"])
                 if key not in last_seen:
                     last_seen.add(key)
                     new_slots.append(s)
-
             if new_slots:
                 notify(new_slots)
-            else:
-                print(f"[{datetime.now()}] No new available slots found.")
 
-        except Exception as e:
-            print(f"[{datetime.now()}] Error: {e}")
+        except Exception:
+            pass
 
-        time.sleep(POLL_INTERVAL)
+        for left in range(POLL_INTERVAL, 0, -1):
+            _render_status_panel(
+                cycle_started_at=cycle_started_at,
+                cycle_no=cycle_no,
+                total_checks=len(monitoring_tasks),
+                current_check=None,
+                available_now=available_now,
+                last_change_at=last_change_at,
+                sleep_left=left,
+                recent_lines=None,
+            )
+            time.sleep(1)
 
 
 if __name__ == "__main__":

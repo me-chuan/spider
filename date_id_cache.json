@@ -1,0 +1,38 @@
+{
+  "by_venue": {
+    "0c6edc93-87ac-41b0-9895-6b66fda93fe5": {
+      "date_id_map": {
+        "2026-04-10": "WbFUbRcCoHgMCMO5w8soXfviYXKFJYfTyWHAgPpXNUk=",
+        "2026-04-11": "cZK5e7km2NKy25ZFab/AOvviYXKFJYfTyWHAgPpXNUk=",
+        "2026-04-12": "nmPKhee14w2QnNj/eoMPRvviYXKFJYfTyWHAgPpXNUk=",
+        "2026-04-13": "0+7IwUAfANR7a/irr4KkAfviYXKFJYfTyWHAgPpXNUk=",
+        "2026-04-14": "F9Shhp52iDqI5QraUGQ5xfviYXKFJYfTyWHAgPpXNUk=",
+        "2026-04-15": "fC/tzZgSf35La7gChCJ5+/viYXKFJYfTyWHAgPpXNUk=",
+        "2026-04-16": "R7gZfG/Cj0ZxxqZSPPc16/viYXKFJYfTyWHAgPpXNUk=",
+        "2026-04-17": "Dy2+RaJwzezpHxild4eX2/viYXKFJYfTyWHAgPpXNUk="
+      },
+      "fieldType": "19f69e5c-872f-4fbb-b9fe-70d6337c2d93",
+      "name": "Huxiaoming tennis court",
+      "refreshed_at": "2026-04-10T15:37:28"
+    },
+    "3466293b-a7d8-45be-a918-8526e3bed4c5": {
+      "date_id_map": {
+        "2026-04-10": "WbFUbRcCoHgMCMO5w8soXfviYXKFJYfTyWHAgPpXNUk=",
+        "2026-04-11": "cZK5e7km2NKy25ZFab/AOvviYXKFJYfTyWHAgPpXNUk=",
+        "2026-04-12": "nmPKhee14w2QnNj/eoMPRvviYXKFJYfTyWHAgPpXNUk=",
+        "2026-04-13": "0+7IwUAfANR7a/irr4KkAfviYXKFJYfTyWHAgPpXNUk=",
+        "2026-04-14": "F9Shhp52iDqI5QraUGQ5xfviYXKFJYfTyWHAgPpXNUk=",
+        "2026-04-15": "fC/tzZgSf35La7gChCJ5+/viYXKFJYfTyWHAgPpXNUk=",
+        "2026-04-16": "R7gZfG/Cj0ZxxqZSPPc16/viYXKFJYfTyWHAgPpXNUk=",
+        "2026-04-17": "Dy2+RaJwzezpHxild4eX2/viYXKFJYfTyWHAgPpXNUk="
+      },
+      "fieldType": "4dd7ae28-cf27-4369-9bc4-ee75b8e3cc76",
+      "name": "Eastern district tennis court",
+      "refreshed_at": "2026-04-10T15:37:28"
+    }
+
+  },
+  "cache_date": "2026-04-10",
+  "last_written_at": "2026-04-10T16:20:44",
+  "version": 1
+}
