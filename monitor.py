@@ -105,12 +105,11 @@ def _availability_signature(slots: List[Dict[str, Any]]) -> Tuple[Tuple[str, str
 
 # ========= 1. CONSTANTS / ENDPOINTS =========
 
-VENUE_DETAIL_URL = "https://sports.sjtu.edu.cn/manage/venue/queryVenueById"
 DATE_ID_URL = "https://sports.sjtu.edu.cn/manage/fieldDetail/queryFieldReserveSituationIsFull"
 VENUE_API_URL = "https://sports.sjtu.edu.cn/manage/fieldDetail/queryFieldSituation"
 
 # How often to check (seconds)
-POLL_INTERVAL = 100
+POLL_INTERVAL = 60
 CHECK_INTERVAL = 1
 
 # Time mapping for the 15 slots (07:00-08:00 to 21:00-22:00)
@@ -319,40 +318,45 @@ def _build_alert_banner(slots: List[Dict[str, Any]]) -> str:
 # ========= 6. PREPARE TASKS =========
 
 def prepare_monitoring_tasks() -> List[Dict[str, Any]]:
-    """
-    Runs once to resolve all fieldTypes and dateIds, creating a list of tasks.
-    Each task is a dictionary with the payload and metadata needed for a single check.
+    """Prepare monitoring tasks for all configured venues."""
+    return _prepare_monitoring_tasks_core(TARGET_CONFIGS, refresh_all=True)
 
-    Daily refresh optimization:
-    - On startup, if the cache file is for today, reuse cached dateId mappings.
-    - Otherwise refresh from API and write cache for today.
 
-    Cache update behavior:
-    - Even on a cache hit day, if you add new courts (venueId) or change fieldType,
-      we will fetch the missing mapping and write it back to the cache file.
-    """
-    print("--- Preparing all monitoring tasks for the day ---")
-    all_tasks = []
+def prepare_monitoring_tasks_for(target_configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Prepare monitoring tasks only for the given subset of target configs."""
+    return _prepare_monitoring_tasks_core(target_configs, refresh_all=False)
+
+
+def _prepare_monitoring_tasks_core(target_configs: List[Dict[str, Any]], *, refresh_all: bool) -> List[Dict[str, Any]]:
+    """Shared implementation used by prepare_monitoring_tasks* functions."""
+    if refresh_all:
+        print("--- Preparing all monitoring tasks for the day ---")
+    else:
+        print("--- Preparing monitoring tasks for selected venues ---")
+
+    all_tasks: List[Dict[str, Any]] = []
 
     today = _today_str()
     cache = load_date_id_cache()
 
-    cache_is_today = cache.get("cache_date") == today
-    if cache_is_today:
-        print(f"--- dateId cache hit for {today}. Skipping refresh. ---")
-    else:
-        print(f"--- dateId cache miss/stale. Refreshing for {today}. ---")
-        cache["cache_date"] = today
-        cache.setdefault("by_venue", {})
-
     cache_changed = False
+    cache_is_today = cache.get("cache_date") == today
+
+    cache.setdefault("by_venue", {})
+
+    if refresh_all:
+        if cache_is_today:
+            print(f"--- dateId cache hit for {today}. Skipping refresh. ---")
+        else:
+            print(f"--- dateId cache miss/stale. Refreshing for {today}. ---")
+            cache["cache_date"] = today
 
     def _cache_snapshot_for(cfg: Dict[str, Any]) -> Tuple[Any, Any]:
         venue_id = cfg.get("venueId")
         entry = cache.get("by_venue", {}).get(venue_id, {}) if venue_id else {}
         return (entry.get("fieldType"), entry.get("date_id_map"))
 
-    for cfg in TARGET_CONFIGS:
+    for cfg in target_configs:
         try:
             print(f"--- Preparing: {cfg['name']} ---")
             field_type = cfg["fieldType"]
@@ -382,76 +386,25 @@ def prepare_monitoring_tasks() -> List[Dict[str, Any]]:
         except Exception as e:
             print(f"  Failed to prepare tasks for {cfg['name']}: {e}")
 
-    # If the day changed OR we fetched any new/changed venue mappings, write cache
-    if (not cache_is_today) or cache_changed:
-        try:
-            cache["cache_date"] = today
-            cache["last_written_at"] = datetime.now().isoformat(timespec="seconds")
-            save_date_id_cache(cache)
-            print(f"--- Wrote dateId cache: {DATE_ID_CACHE_PATH} ---")
-        except Exception as e:
-            print(f"[{datetime.now()}] Warning: failed to write dateId cache: {e}")
-
-    print(f"--- Preparation complete. Found {len(all_tasks)} total date/venue combinations to monitor. ---")
-    return all_tasks
-
-
-def prepare_monitoring_tasks_for(target_configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Similar to prepare_monitoring_tasks(), but only for the given subset of target configs.
-
-    Note: this also persists `date_id_cache.json` if it had to fetch any uncached mappings.
-    """
-    print(f"--- Preparing monitoring tasks for selected venues ---")
-    all_tasks = []
-
-    today = _today_str()
-    cache = load_date_id_cache()
-
-    cache_changed = False
-
-    def _cache_snapshot_for(cfg: Dict[str, Any]) -> Tuple[Any, Any]:
-        venue_id = cfg.get("venueId")
-        entry = cache.get("by_venue", {}).get(venue_id, {}) if venue_id else {}
-        return (entry.get("fieldType"), entry.get("date_id_map"))
-
-    for cfg in target_configs:
-        try:
-            print(f"--- Preparing: {cfg['name']} ---")
-            field_type = cfg["fieldType"]
-
-            before = _cache_snapshot_for(cfg)
-            date_id_map = get_or_refresh_date_id_map(cfg, cache, today)
-            after = _cache_snapshot_for(cfg)
-            if after != before:
-                cache_changed = True
-
-            if not date_id_map:
-                print(f"  Could not fetch any dates for {cfg['name']}")
-                continue
-
-            print(f"  Found {len(date_id_map)} dates to check for {cfg['name']}.")
-
-            for target_date, date_id in date_id_map.items():
-                payload = build_field_situation_payload(cfg["venueId"], cfg["fieldType"], target_date, date_id)
-                task = {
-                    "top_venue_name": cfg["name"],
-                    "top_venue_id": cfg["venueId"],
-                    "target_date": target_date,
-                    "payload": payload,
-                }
-                all_tasks.append(task)
-        except Exception as e:
-            print(f"  Failed to prepare tasks for {cfg['name']}: {e}")
-
-    if cache_changed:
-        try:
-            cache["cache_date"] = today
-            cache["last_written_at"] = datetime.now().isoformat(timespec="seconds")
-            save_date_id_cache(cache)
-            print(f"--- Wrote dateId cache: {DATE_ID_CACHE_PATH} ---")
-        except Exception as e:
-            print(f"[{datetime.now()}] Warning: failed to write dateId cache: {e}")
+    # Cache write behavior mirrors the original functions
+    if refresh_all:
+        if (not cache_is_today) or cache_changed:
+            try:
+                cache["cache_date"] = today
+                cache["last_written_at"] = datetime.now().isoformat(timespec="seconds")
+                save_date_id_cache(cache)
+                print(f"--- Wrote dateId cache: {DATE_ID_CACHE_PATH} ---")
+            except Exception as e:
+                print(f"[{datetime.now()}] Warning: failed to write dateId cache: {e}")
+    else:
+        if cache_changed:
+            try:
+                cache["cache_date"] = today
+                cache["last_written_at"] = datetime.now().isoformat(timespec="seconds")
+                save_date_id_cache(cache)
+                print(f"--- Wrote dateId cache: {DATE_ID_CACHE_PATH} ---")
+            except Exception as e:
+                print(f"[{datetime.now()}] Warning: failed to write dateId cache: {e}")
 
     print(f"--- Preparation complete. Found {len(all_tasks)} total date/venue combinations to monitor. ---")
     return all_tasks
@@ -469,8 +422,6 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
         print("No tasks to monitor. Exiting.")
         return
 
-    last_seen: set[Tuple[str, str]] = set()
-
     # TUI state
     available_now: List[Dict[str, Any]] = []
     last_avail_sig: Tuple[Tuple[str, str, str, str], ...] = tuple()
@@ -479,7 +430,7 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
     # Persistent error log across refreshes
     error_lines: List[str] = []
 
-    # Alert state (sticky for a short time after detection)
+    # Alert state (used for terminal bell +高亮提示)
     alert_until_ts: float = 0.0
     last_alert_sig: Tuple[Tuple[str, str, str, str], ...] = tuple()
 
@@ -499,9 +450,13 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
         cycle_no += 1
         cycle_started_at = datetime.now()
 
-        # Expire availability from previous cycle so AVAILABLE NOW only shows fresh data
+        # 每轮开始时清空上一轮的即时可用列表
+        # 并且重置 alert 状态，这样只要在这一轮里再次检测到可用场地，
+        # 就会再次触发终端铃声和高亮提示。
         available_now = []
         last_avail_sig = tuple()
+        alert_until_ts = 0.0
+        last_alert_sig = tuple()
 
         # Track a panel message for outer-loop failures
         outer_recent_lines: List[str] | None = None
@@ -630,11 +585,6 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                 last_avail_sig = sig
                 available_now = now_available
                 last_change_at = datetime.now()
-
-            # Keep a "seen" set so the project can re-introduce alerts later if desired.
-            for s in now_available:
-                key = (s["top_venue_name"], s["venue"], s["date"], s["time"])
-                last_seen.add(key)
 
         except Exception as e:
             msg = f"[{datetime.now():%H:%M:%S}] Cycle error: {e}"
