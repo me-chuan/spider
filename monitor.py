@@ -109,7 +109,7 @@ DATE_ID_URL = "https://sports.sjtu.edu.cn/manage/fieldDetail/queryFieldReserveSi
 VENUE_API_URL = "https://sports.sjtu.edu.cn/manage/fieldDetail/queryFieldSituation"
 
 # How often to check (seconds)
-POLL_INTERVAL = 60
+POLL_INTERVAL = 180
 CHECK_INTERVAL = 1
 
 # Time mapping for the 15 slots (07:00-08:00 to 21:00-22:00)
@@ -163,9 +163,15 @@ def get_or_refresh_date_id_map(cfg: Dict[str, Any], cache: Dict[str, Any], today
     venue_entry = cache.get("by_venue", {}).get(venue_id, {})
     cached_field_type = venue_entry.get("fieldType")
     cached_map = venue_entry.get("date_id_map")
+    cached_refreshed_date = venue_entry.get("refreshed_date")
 
-    # Cache is valid only if it's for today AND same fieldType AND has a mapping
-    if cache.get("cache_date") == today and cached_field_type == field_type and isinstance(cached_map, dict) and cached_map:
+    # Cache is valid per-venue: only if it's refreshed today AND same fieldType AND has a mapping.
+    if (
+        cached_refreshed_date == today
+        and cached_field_type == field_type
+        and isinstance(cached_map, dict)
+        and cached_map
+    ):
         return {str(k): str(v) for k, v in cached_map.items() if k and v}
 
     # Refresh from API
@@ -176,6 +182,7 @@ def get_or_refresh_date_id_map(cfg: Dict[str, Any], cache: Dict[str, Any], today
             "name": cfg.get("name"),
             "fieldType": field_type,
             "date_id_map": date_id_map,
+            "refreshed_date": today,
             "refreshed_at": datetime.now().isoformat(timespec="seconds"),
         }
     return date_id_map
@@ -340,21 +347,17 @@ def _prepare_monitoring_tasks_core(target_configs: List[Dict[str, Any]], *, refr
     cache = load_date_id_cache()
 
     cache_changed = False
-    cache_is_today = cache.get("cache_date") == today
 
     cache.setdefault("by_venue", {})
 
     if refresh_all:
-        if cache_is_today:
-            print(f"--- dateId cache hit for {today}. Skipping refresh. ---")
-        else:
-            print(f"--- dateId cache miss/stale. Refreshing for {today}. ---")
-            cache["cache_date"] = today
+        # Informational only: actual refresh decision is per-venue via refreshed_date.
+        print(f"--- Ensuring dateId cache is up-to-date per venue for {today}. ---")
 
-    def _cache_snapshot_for(cfg: Dict[str, Any]) -> Tuple[Any, Any]:
+    def _cache_snapshot_for(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any]:
         venue_id = cfg.get("venueId")
         entry = cache.get("by_venue", {}).get(venue_id, {}) if venue_id else {}
-        return (entry.get("fieldType"), entry.get("date_id_map"))
+        return (entry.get("fieldType"), entry.get("refreshed_date"), entry.get("date_id_map"))
 
     for cfg in target_configs:
         try:
@@ -386,20 +389,20 @@ def _prepare_monitoring_tasks_core(target_configs: List[Dict[str, Any]], *, refr
         except Exception as e:
             print(f"  Failed to prepare tasks for {cfg['name']}: {e}")
 
-    # Cache write behavior mirrors the original functions
+    # Cache write behavior:
+    # - refresh_all: write at least once per day (for cache_date/metadata), and also whenever venue entries changed
+    # - refresh subset: only write when a venue entry changed
     if refresh_all:
-        if (not cache_is_today) or cache_changed:
-            try:
-                cache["cache_date"] = today
-                cache["last_written_at"] = datetime.now().isoformat(timespec="seconds")
-                save_date_id_cache(cache)
-                print(f"--- Wrote dateId cache: {DATE_ID_CACHE_PATH} ---")
-            except Exception as e:
-                print(f"[{datetime.now()}] Warning: failed to write dateId cache: {e}")
+        try:
+            cache["cache_date"] = today
+            cache["last_written_at"] = datetime.now().isoformat(timespec="seconds")
+            save_date_id_cache(cache)
+            print(f"--- Wrote dateId cache: {DATE_ID_CACHE_PATH} ---")
+        except Exception as e:
+            print(f"[{datetime.now()}] Warning: failed to write dateId cache: {e}")
     else:
         if cache_changed:
             try:
-                cache["cache_date"] = today
                 cache["last_written_at"] = datetime.now().isoformat(timespec="seconds")
                 save_date_id_cache(cache)
                 print(f"--- Wrote dateId cache: {DATE_ID_CACHE_PATH} ---")
@@ -504,6 +507,20 @@ def main_loop(target_configs: List[Dict[str, Any]] | None = None):
                     content_type = resp.headers.get("Content-Type", "")
                     if "application/json" in content_type:
                         data = resp.json()
+
+                        # Persist server-side error codes/messages in the TUI.
+                        # E.g. {"code": 500, "msg": "每日请求超过限制，无法获取", ...}
+                        server_code = data.get("code")
+                        if server_code is not None and server_code != 0:
+                            msg = (
+                                f"[{datetime.now():%H:%M:%S}] Server error: code={server_code} "
+                                f"msg={data.get('msg') or ''} msgEn={data.get('msgEn') or ''}"
+                            ).strip()
+                            recent_lines.append(msg)
+                            error_lines.append(msg)
+                            if len(error_lines) > 100:
+                                del error_lines[:-100]
+
                         slots = parse_slots_from_json(data)
 
                         for s in slots:
