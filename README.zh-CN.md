@@ -42,6 +42,17 @@ pip install requests
 python main.py
 ```
 
+## Tampermonkey 版本（无需手动复制 cookie）
+
+如果你更希望在浏览器里长期挂着监控，并自动复用当前登录态，可导入 `sjtu_venue_monitor.user.js`。
+
+1. 浏览器安装 Tampermonkey。
+2. 新建脚本并粘贴 `sjtu_venue_monitor.user.js` 内容（或直接导入）。
+3. 打开并保持任意 `https://sports.sjtu.edu.cn/*` 页面处于登录状态。
+4. 脚本会在页面内轮询，显示悬浮面板，并在余量变化时提醒。
+
+可直接在 userscript 内调整 `TARGET_CONFIGS`、`POLL_INTERVAL_MS`、`INTERESTING_VENUES`、`INTERESTING_HOURS`。
+
 ### 按场地类型过滤
 
 如果你的 `TARGET_CONFIGS` 内包含 `type` 字段（不区分大小写），例如：`tennis`、`badminton`、`gym`，可以使用以下参数只监控某一类：
@@ -80,6 +91,7 @@ python main.py --tennis --gym
 - `monitor.py`：轮询逻辑 + 终端 UI
 - `config.py`：监控目标、headers/cookies
 - `date_id_cache.json`：程序自动生成/更新的每日缓存
+- `sjtu_venue_monitor.user.js`：Tampermonkey userscript 版本（基于浏览器登录态，无需手动复制 cookie）
 
 ## 常见问题
 

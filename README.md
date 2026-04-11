@@ -40,6 +40,17 @@ Run the monitor:
 python main.py
 ```
 
+## Tampermonkey version (no cookie copy/paste)
+
+If you prefer browser-side monitoring that reuses your current login session automatically, import `sjtu_venue_monitor.user.js` into Tampermonkey.
+
+1. Install Tampermonkey in your browser.
+2. Create a new script and paste the content of `sjtu_venue_monitor.user.js` (or use Tampermonkey import).
+3. Open and keep any `https://sports.sjtu.edu.cn/*` page logged in.
+4. The script will poll in the page, show an overlay panel, and alert on availability changes.
+
+Customize `TARGET_CONFIGS`, `POLL_INTERVAL_MS`, `INTERESTING_VENUES`, and `INTERESTING_HOURS` directly in the userscript.
+
 ### Filter by venue type
 
 If your `TARGET_CONFIGS` items include a `type` field (case-insensitive) such as `tennis`, `badminton`, `gym`, you can filter what gets monitored:
@@ -78,6 +89,7 @@ When spare venues are found, you should see:
 - `monitor.py`: polling logic + terminal UI
 - `config.py`: your targets + headers/cookies
 - `date_id_cache.json`: daily cache generated/updated by the program
+- `sjtu_venue_monitor.user.js`: Tampermonkey userscript version (browser session-based, no manual cookie copy)
 
 ## Notes / Troubleshooting
 

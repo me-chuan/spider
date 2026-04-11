@@ -324,6 +324,49 @@ def _build_alert_banner(slots: List[Dict[str, Any]]) -> str:
 
 # ========= 6. PREPARE TASKS =========
 
+# New helper: refresh and persist dateId cache for all configured venues.
+# Can be imported and called from another script (e.g., a cron job) before running main.py.
+def refresh_all_date_ids_for_today() -> None:
+    """Force-refresh date->dateId mappings for all TARGET_CONFIGS and write cache to disk.
+
+    Useful when dateId changes more often than once per day (e.g. 00:00 and 12:00):
+    you can schedule/trigger this function separately from the monitor loop.
+    """
+    today = _today_str()
+    cache = load_date_id_cache()
+    cache.setdefault("by_venue", {})
+
+    print(f"--- Forcing dateId refresh for all venues for {today} ---")
+
+    for cfg in TARGET_CONFIGS:
+        try:
+            venue_id = cfg["venueId"]
+            field_type = cfg["fieldType"]
+            print(f"--- Refreshing dateIds for: {cfg['name']} (venueId={venue_id}) ---")
+            date_id_map = fetch_date_ids(venue_id, field_type, today)
+            if not date_id_map:
+                print(f"  No dates returned for {cfg['name']}")
+                continue
+            cache["by_venue"][venue_id] = {
+                "name": cfg.get("name"),
+                "fieldType": field_type,
+                "date_id_map": date_id_map,
+                "refreshed_date": today,
+                "refreshed_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            print(f"  Updated {len(date_id_map)} dates for {cfg['name']}")
+        except Exception as e:
+            print(f"  Failed to refresh dateIds for {cfg.get('name', venue_id)}: {e}")
+
+    try:
+        cache["cache_date"] = today
+        cache["last_written_at"] = datetime.now().isoformat(timespec="seconds")
+        save_date_id_cache(cache)
+        print(f"--- Finished refreshing all dateIds. Wrote cache: {DATE_ID_CACHE_PATH} ---")
+    except Exception as e:
+        print(f"[{datetime.now()}] Warning: failed to write dateId cache after full refresh: {e}")
+
+
 def prepare_monitoring_tasks() -> List[Dict[str, Any]]:
     """Prepare monitoring tasks for all configured venues."""
     return _prepare_monitoring_tasks_core(TARGET_CONFIGS, refresh_all=True)
