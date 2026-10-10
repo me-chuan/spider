@@ -58,5 +58,12 @@ def main() -> None:
     main_loop(targets)
 
 
+def run_cli() -> None:
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n监控已停止。")
+
+
 if __name__ == "__main__":
-    main()
+    run_cli()

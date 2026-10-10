@@ -1,3 +1,8 @@
+import json
+import os
+from pathlib import Path
+
+
 TARGET_CONFIGS = [
     {
         "name": "Huxiaoming tennis court",
@@ -53,8 +58,56 @@ HEADERS = {
     "Referer": "https://sports.sjtu.edu.cn/pc/",
 }
 
-COOKIES = {
-		"_ga": "GA1.1.1974817216.1753965581",
-		"_ga_VGHWLGCC9B": "GS2.1.s1753965580$o1$g1$t1753965998$j56$l0$h0",
-		"JSESSIONID": "514e75b6-4455-4613-8ca2-1d59ed4f3fe6"
-}
+COOKIE_FILE_PATH = Path(__file__).with_name("cookies.json")
+
+
+def _parse_cookie_header(header: str) -> dict[str, str]:
+    cookies: dict[str, str] = {}
+    for part in header.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        name, separator, value = part.partition("=")
+        if not separator or not name.strip():
+            raise ValueError("Cookie must contain name=value pairs separated by semicolons")
+        cookies[name.strip()] = value.strip()
+    return cookies
+
+
+def load_cookies() -> dict[str, str]:
+    """Use the local JSON file first; environment settings remain a fallback."""
+    if COOKIE_FILE_PATH.exists():
+        try:
+            with COOKIE_FILE_PATH.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{COOKIE_FILE_PATH} is not readable valid JSON: {exc}") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("cookie_header"), str):
+            raise ValueError(f"{COOKIE_FILE_PATH} must contain a string named cookie_header")
+        return _parse_cookie_header(data["cookie_header"])
+
+    # A copied Request Headers > Cookie value is authoritative over older env settings.
+    header = os.environ.get("SJTU_COOKIE_HEADER", "").strip()
+    if header:
+        return _parse_cookie_header(header)
+
+    raw = os.environ.get("SJTU_COOKIES_JSON")
+    cookies: dict[str, str] = {}
+    if raw:
+        try:
+            cookies = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("SJTU_COOKIES_JSON is invalid JSON; clear it or set SJTU_COOKIE_HEADER") from exc
+        if not isinstance(cookies, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in cookies.items()
+        ):
+            raise ValueError("SJTU_COOKIES_JSON must be a JSON object of string values")
+
+    session_id = os.environ.get("SJTU_JSESSIONID", "").strip()
+    if session_id:
+        cookies["JSESSIONID"] = session_id
+    return cookies
+
+
+COOKIES = load_cookies()

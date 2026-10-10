@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+date_id_cache.json
+date_id_cache.json.tmp
+cookies.json

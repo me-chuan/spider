@@ -1,689 +1,488 @@
-import requests
-import time
-from datetime import datetime
-from typing import List, Dict, Any, Tuple
+"""Poll SJTU Sports and show the state of each check in a terminal dashboard."""
+
 import json
 import os
+import time
+from datetime import datetime
+from typing import Any
 
-from config import TARGET_CONFIGS, HEADERS, COOKIES
+import requests
 
-# ========= terminal UI helpers =========
+from config import COOKIES, HEADERS, TARGET_CONFIGS
 
-def _clear_screen() -> None:
-    # ANSI clear screen + cursor home
-    print("\033[2J\033[H", end="")
-
-
-def _terminal_bell(repeat: int = 1, interval: float = 0.15) -> None:
-    """Emit an audible/visible terminal bell (best-effort)."""
-    for i in range(max(1, repeat)):
-        print("\a", end="", flush=True)
-        if i != repeat - 1:
-            time.sleep(interval)
-
-
-def _render_status_panel(
-    *,
-    cycle_started_at: datetime,
-    cycle_no: int,
-    total_checks: int,
-    current_check: str | None,
-    available_now: List[Dict[str, Any]],
-    last_change_at: datetime | None,
-    sleep_left: int | None,
-    recent_lines: List[str] | None = None,
-    error_lines: List[str] | None = None,
-    alert_banner: str | None = None,
-) -> None:
-    """Render a compact always-on-top status view."""
-    _clear_screen()
-
-    now = datetime.now()
-    header = f"SJTU Venue Monitor | now={now:%Y-%m-%d %H:%M:%S} | cycle={cycle_no} | checks={total_checks}"
-    print(header)
-    print("=" * len(header))
-
-    if alert_banner:
-        # Inverse video + bold (best-effort ANSI)
-        print(f"\n\033[1;7m {alert_banner} \033[0m\n")
-
-    if current_check:
-        print(f"Checking: {current_check}")
-    else:
-        print("Checking: (idle)")
-
-    if last_change_at:
-        print(f"Last availability change: {last_change_at:%Y-%m-%d %H:%M:%S}")
-    else:
-        print("Last availability change: (none)")
-
-    if sleep_left is not None:
-        print(f"Next poll in: {sleep_left}s")
-    else:
-        print("Next poll in: (running)")
-
-    print("\nAVAILABLE NOW (court + date)")
-    print("---------------------------")
-
-    pairs = sorted({(s.get("top_venue_name", "?"), s.get("date", "?")) for s in available_now})
-    if not pairs:
-        print("(none)")
-    else:
-        for court, date in pairs[:200]:
-            print(f"- {court} | {date}")
-        if len(pairs) > 200:
-            print(f"... and {len(pairs) - 200} more")
-
-    if recent_lines:
-        print("\nTASK OUTPUT")
-        print("-----------")
-        for line in recent_lines[-25:]:
-            print(line)
-
-    # Persistent error area so important problems (like expired cookies)
-    # are not immediately cleared by UI refreshes.
-    print("\nERRORS")
-    print("------")
-    if error_lines:
-        for line in error_lines[-10:]:
-            print(line)
-    else:
-        print("(none)")
-
-
-def _availability_signature(slots: List[Dict[str, Any]]) -> Tuple[Tuple[str, str, str, str], ...]:
-    """Stable signature for 'currently available' list."""
-    keys = []
-    for s in slots:
-        keys.append((
-            str(s.get("top_venue_name")),
-            str(s.get("venue")),
-            str(s.get("date")),
-            str(s.get("time")),
-        ))
-    return tuple(sorted(set(keys)))
-
-# ========= 1. CONSTANTS / ENDPOINTS =========
 
 DATE_ID_URL = "https://sports.sjtu.edu.cn/manage/fieldDetail/queryFieldReserveSituationIsFull"
 VENUE_API_URL = "https://sports.sjtu.edu.cn/manage/fieldDetail/queryFieldSituation"
-
-# How often to check (seconds)
-POLL_INTERVAL = 180
-CHECK_INTERVAL = 1
-
-# Time mapping for the 15 slots (07:00-08:00 to 21:00-22:00)
-TIME_SLOTS = [f"{h:02d}:00-{h+1:02d}:00" for h in range(7, 22)]
-
-# Optional simple filter: only these venues/times are interesting
-INTERESTING_VENUES: List[str] = []  # top-level venue names
-INTERESTING_HOURS: List[str] = []   # e.g. ["19:00-20:00"]
-
-# Persistent cache for dateId refresh (1 refresh per day)
+POLL_INTERVAL = 180  # Idle time after a complete scan, in seconds.
+CHECK_INTERVAL = 1  # Minimum pause between field requests.
+TIME_SLOTS = [f"{hour:02d}:00-{hour + 1:02d}:00" for hour in range(7, 22)]
+INTERESTING_VENUES: list[str] = []
+INTERESTING_HOURS: list[str] = []
+CACHE_VERSION = 2
 DATE_ID_CACHE_PATH = os.path.join(os.path.dirname(__file__), "date_id_cache.json")
+
+
+class AuthenticationError(ValueError):
+    """The venue API rejected the supplied login session."""
+
+
+def _login_error_message(exc: AuthenticationError) -> str:
+    return (
+        f"登录态无效或已过期：{exc}\n"
+        "请在浏览器重新登录，复制 sports.sjtu.edu.cn 场地接口请求实际发送的整段 Cookie，"
+        "填入 cookies.json 的 cookie_header 后重启。仅有 _ga Cookie 通常不够。"
+    )
 
 
 def _today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def load_date_id_cache() -> Dict[str, Any]:
-    """Load cache JSON from disk. Returns a normalized dict."""
+def _empty_cache() -> dict[str, Any]:
+    return {"version": CACHE_VERSION, "by_target": {}}
+
+
+def load_date_id_cache() -> dict[str, Any]:
     try:
-        if not os.path.exists(DATE_ID_CACHE_PATH):
-            return {"cache_date": None, "version": 1, "by_venue": {}}
-        with open(DATE_ID_CACHE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return {"cache_date": None, "version": 1, "by_venue": {}}
-        data.setdefault("cache_date", None)
-        data.setdefault("version", 1)
-        data.setdefault("by_venue", {})
-        if not isinstance(data["by_venue"], dict):
-            data["by_venue"] = {}
-        return data
-    except Exception as e:
-        print(f"[{datetime.now()}] Warning: failed to load dateId cache: {e}. Will refresh.")
-        return {"cache_date": None, "version": 1, "by_venue": {}}
+        with open(DATE_ID_CACHE_PATH, "r", encoding="utf-8") as file:
+            cache = json.load(file)
+        if (
+            not isinstance(cache, dict)
+            or cache.get("version") != CACHE_VERSION
+            or not isinstance(cache.get("by_target"), dict)
+        ):
+            return _empty_cache()
+        return cache
+    except FileNotFoundError:
+        return _empty_cache()
+    except (OSError, ValueError) as exc:
+        print(f"Warning: could not load dateId cache: {exc}")
+        return _empty_cache()
 
 
-def save_date_id_cache(cache: Dict[str, Any]) -> None:
-    """Atomically write cache JSON to disk."""
-    tmp = DATE_ID_CACHE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2, sort_keys=True)
-    os.replace(tmp, DATE_ID_CACHE_PATH)
+def save_date_id_cache(cache: dict[str, Any]) -> None:
+    """Replace the cache atomically so an interrupted write cannot corrupt it."""
+    temporary_path = DATE_ID_CACHE_PATH + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as file:
+        json.dump(cache, file, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(temporary_path, DATE_ID_CACHE_PATH)
 
 
-def get_or_refresh_date_id_map(cfg: Dict[str, Any], cache: Dict[str, Any], today: str) -> Dict[str, str]:
-    """Return date->dateId mapping for a venue+fieldType from cache or by refreshing API."""
-    venue_id = cfg["venueId"]
-    field_type = cfg["fieldType"]
+def _cache_key(venue_id: str, field_type: str) -> str:
+    return f"{venue_id}|{field_type}"
 
-    venue_entry = cache.get("by_venue", {}).get(venue_id, {})
-    cached_field_type = venue_entry.get("fieldType")
-    cached_map = venue_entry.get("date_id_map")
-    cached_refreshed_date = venue_entry.get("refreshed_date")
 
-    # Cache is valid per-venue: only if it's refreshed today AND same fieldType AND has a mapping.
-    if (
-        cached_refreshed_date == today
-        and cached_field_type == field_type
-        and isinstance(cached_map, dict)
-        and cached_map
-    ):
-        return {str(k): str(v) for k, v in cached_map.items() if k and v}
+def get_or_refresh_date_id_map(
+    cfg: dict[str, Any], cache: dict[str, Any], today: str
+) -> dict[str, str]:
+    key = _cache_key(cfg["venueId"], cfg["fieldType"])
+    entry = cache["by_target"].get(key, {})
+    cached_map = entry.get("date_id_map")
+    if entry.get("cache_date") == today and isinstance(cached_map, dict) and cached_map:
+        return {str(date): str(date_id) for date, date_id in cached_map.items() if date and date_id}
 
-    # Refresh from API
-    date_id_map = fetch_date_ids(venue_id, field_type, today)
+    date_id_map = fetch_date_ids(cfg["venueId"], cfg["fieldType"], today)
     if date_id_map:
-        cache.setdefault("by_venue", {})
-        cache["by_venue"][venue_id] = {
-            "name": cfg.get("name"),
-            "fieldType": field_type,
+        cache["by_target"][key] = {
+            "name": cfg["name"],
+            "cache_date": today,
             "date_id_map": date_id_map,
-            "refreshed_date": today,
             "refreshed_at": datetime.now().isoformat(timespec="seconds"),
         }
     return date_id_map
 
 
-# ========= 2. FETCHING HELPERS =========
-
-def fetch_with_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    resp = requests.post(
-        url,
-        headers=HEADERS,
-        cookies=COOKIES,
-        json=payload,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def fetch_date_ids(venue_id: str, field_type: str, base_date: str) -> Dict[str, str]:
-    """Return mapping date -> dateId for the range returned by the API, based on one date query."""
-    payload = {
-        "id": venue_id,
-        "feildType": field_type,
-        "date": base_date,
-    }
-    data = fetch_with_json(DATE_ID_URL, payload)
-    result: Dict[str, str] = {}
-    for item in data.get("data", []):
-        d = item.get("date")
-        did = item.get("dateId")
-        if d and did:
-            result[d] = did
-    return result
-
-
-def build_field_situation_payload(venue_id: str, field_type: str, date: str, date_id: str) -> Dict[str, Any]:
-    return {
-        "fieldType": field_type,
-        "date": date,
-        "venueId": venue_id,
-        "dateId": date_id,
-    }
-
-
-def fetch_raw_response(payload: Dict[str, Any]) -> requests.Response:
-    """Perform the HTTP POST to the venue field situation API."""
-    resp = requests.post(
-        VENUE_API_URL,
-        headers=HEADERS,
-        cookies=COOKIES,
-        json=payload,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp
-
-
-# ========= 3. PARSING =========
-
-def parse_slots_from_json(json_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Parse SJTU sports JSON, returning ALL slots (not only available ones).
-    """
-    slots: List[Dict[str, Any]] = []
-
-    if json_data.get("code") != 0:
-        print(f"Server returned non-zero code: {json_data.get('code')} {json_data.get('msg')}")
-        return slots
-
-    for field in json_data.get("data", []):
-        field_name = field.get("fieldNameEn") or field.get("fieldName") or "UNKNOWN"
-        field_id = field.get("fieldId")
-        price_list = field.get("priceList", [])
-
-        for idx, item in enumerate(price_list):
-            raw_count = item.get("count", 0)
-            try:
-                count_int = int(raw_count)
-            except (TypeError, ValueError):
-                count_int = 0
-
-            # Map slot index to a human-readable time string
-            time_str = TIME_SLOTS[idx] if idx < len(TIME_SLOTS) else f"slot_{idx}"
-
-            slots.append({
-                "venue": field_name,
-                "venue_id": field_id,
-                "time": time_str,
-                "slot_index": idx,
-                "count": count_int,
-                "price": item.get("price"),
-                "status": str(item.get("status", "")),
-                "raw": item,
-            })
-
-    return slots
-
-
-# ========= 4. FILTERING / DEDUP =========
-
-def filter_slots(slots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Apply simple filters like venue name / hours of day, if configured."""
-    # First, get only available slots
-    available = [s for s in slots if s.get("count", 0) != 0]
-
-    if not INTERESTING_VENUES and not INTERESTING_HOURS:
-        return available
-
-    filtered: List[Dict[str, Any]] = []
-    for s in available:
-        # Note: INTERESTING_HOURS requires time mapping to be implemented
-        if INTERESTING_VENUES and s["venue"] not in INTERESTING_VENUES:
-            continue
-        if INTERESTING_HOURS and s["time"] not in INTERESTING_HOURS:
-            continue
-        filtered.append(s)
-
-    return filtered
-
-
-def _format_available_pairs(slots: List[Dict[str, Any]], limit: int = 12) -> str:
-    pairs = sorted({(s.get("top_venue_name", "?"), s.get("date", "?")) for s in slots})
-    if not pairs:
-        return "(none)"
-    head = pairs[:limit]
-    more = len(pairs) - len(head)
-    lines = [f"{court} | {date}" for court, date in head]
-    if more > 0:
-        lines.append(f"...and {more} more")
-    return "\n".join(lines)
-
-
-def _build_alert_banner(slots: List[Dict[str, Any]]) -> str:
-    # Keep banner readable in terminal: short title + first few pairs.
-    body = _format_available_pairs(slots, limit=4)
-    return "SPARE VENUES FOUND!\n" + body
-
-
-# ========= 6. PREPARE TASKS =========
-
-# New helper: refresh and persist dateId cache for all configured venues.
-# Can be imported and called from another script (e.g., a cron job) before running main.py.
 def refresh_all_date_ids_for_today() -> None:
-    """Force-refresh date->dateId mappings for all TARGET_CONFIGS and write cache to disk.
-
-    Useful when dateId changes more often than once per day (e.g. 00:00 and 12:00):
-    you can schedule/trigger this function separately from the monitor loop.
-    """
+    """Force-refresh every configured target's date IDs and save successful results."""
     today = _today_str()
     cache = load_date_id_cache()
-    cache.setdefault("by_venue", {})
-
-    print(f"--- Forcing dateId refresh for all venues for {today} ---")
+    updated = 0
+    errors: list[str] = []
 
     for cfg in TARGET_CONFIGS:
         try:
-            venue_id = cfg["venueId"]
-            field_type = cfg["fieldType"]
-            print(f"--- Refreshing dateIds for: {cfg['name']} (venueId={venue_id}) ---")
-            date_id_map = fetch_date_ids(venue_id, field_type, today)
+            date_id_map = fetch_date_ids(cfg["venueId"], cfg["fieldType"], today)
             if not date_id_map:
-                print(f"  No dates returned for {cfg['name']}")
+                errors.append(f"{cfg['name']}: no dates returned")
                 continue
-            cache["by_venue"][venue_id] = {
-                "name": cfg.get("name"),
-                "fieldType": field_type,
+            cache["by_target"][_cache_key(cfg["venueId"], cfg["fieldType"])] = {
+                "name": cfg["name"],
+                "cache_date": today,
                 "date_id_map": date_id_map,
-                "refreshed_date": today,
                 "refreshed_at": datetime.now().isoformat(timespec="seconds"),
             }
-            print(f"  Updated {len(date_id_map)} dates for {cfg['name']}")
-        except Exception as e:
-            print(f"  Failed to refresh dateIds for {cfg.get('name', venue_id)}: {e}")
+            updated += 1
+        except AuthenticationError as exc:
+            raise SystemExit(_login_error_message(exc)) from None
+        except Exception as exc:
+            errors.append(f"{cfg['name']}: {exc}")
 
-    try:
-        cache["cache_date"] = today
-        cache["last_written_at"] = datetime.now().isoformat(timespec="seconds")
+    if updated:
         save_date_id_cache(cache)
-        print(f"--- Finished refreshing all dateIds. Wrote cache: {DATE_ID_CACHE_PATH} ---")
-    except Exception as e:
-        print(f"[{datetime.now()}] Warning: failed to write dateId cache after full refresh: {e}")
+    print(f"Date IDs refreshed for {updated}/{len(TARGET_CONFIGS)} targets.")
+    for error in errors:
+        print(f"- {error}")
 
 
-def prepare_monitoring_tasks() -> List[Dict[str, Any]]:
-    """Prepare monitoring tasks for all configured venues."""
-    return _prepare_monitoring_tasks_core(TARGET_CONFIGS, refresh_all=True)
+def fetch_with_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    response = requests.post(url, headers=HEADERS, cookies=COOKIES, json=payload, timeout=15)
+    if getattr(response, "status_code", None) == 401:
+        raise AuthenticationError("HTTP 401")
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError("API response is not a JSON object")
+    return data
 
 
-def prepare_monitoring_tasks_for(target_configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Prepare monitoring tasks only for the given subset of target configs."""
-    return _prepare_monitoring_tasks_core(target_configs, refresh_all=False)
+def _response_items(data: dict[str, Any]) -> list[dict[str, Any]]:
+    if str(data.get("code")) == "401":
+        raise AuthenticationError(f"API error 401: {data.get('msg', '未登录或登录超时')}")
+    if data.get("code") != 0:
+        raise ValueError(f"API error {data.get('code')}: {data.get('msg', 'unknown error')}")
+    items = data.get("data")
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        raise ValueError("API response has no valid data list")
+    return items
 
 
-def _prepare_monitoring_tasks_core(target_configs: List[Dict[str, Any]], *, refresh_all: bool) -> List[Dict[str, Any]]:
-    """Shared implementation used by prepare_monitoring_tasks* functions."""
-    if refresh_all:
-        print("--- Preparing all monitoring tasks for the day ---")
-    else:
-        print("--- Preparing monitoring tasks for selected venues ---")
+def fetch_date_ids(venue_id: str, field_type: str, base_date: str) -> dict[str, str]:
+    # The endpoint really spells this field "feildType".
+    payload = {"id": venue_id, "feildType": field_type, "date": base_date}
+    items = _response_items(fetch_with_json(DATE_ID_URL, payload))
+    return {
+        str(item["date"]): str(item["dateId"])
+        for item in items
+        if item.get("date") and item.get("dateId")
+    }
 
-    all_tasks: List[Dict[str, Any]] = []
 
+def build_field_situation_payload(
+    venue_id: str, field_type: str, date: str, date_id: str
+) -> dict[str, str]:
+    return {"fieldType": field_type, "date": date, "venueId": venue_id, "dateId": date_id}
+
+
+def fetch_raw_response(payload: dict[str, Any]) -> requests.Response:
+    response = requests.post(
+        VENUE_API_URL, headers=HEADERS, cookies=COOKIES, json=payload, timeout=15
+    )
+    if getattr(response, "status_code", None) == 401:
+        raise AuthenticationError("HTTP 401")
+    response.raise_for_status()
+    return response
+
+
+def parse_slots_from_json(json_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Parse every field and time slot; invalid API responses are check failures."""
+    slots: list[dict[str, Any]] = []
+    for field in _response_items(json_data):
+        field_name = field.get("fieldNameEn") or field.get("fieldName") or "UNKNOWN"
+        price_list = field.get("priceList")
+        if not isinstance(price_list, list):
+            raise ValueError("API field has no valid priceList")
+        for index, item in enumerate(price_list):
+            if not isinstance(item, dict):
+                raise ValueError("API priceList contains an invalid slot")
+            try:
+                count = int(item["count"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("API slot has no valid availability count") from exc
+            slots.append(
+                {
+                    "venue": field_name,
+                    "venue_id": field.get("fieldId"),
+                    "time": TIME_SLOTS[index] if index < len(TIME_SLOTS) else f"slot_{index}",
+                    "slot_index": index,
+                    "count": count,
+                    "price": item.get("price"),
+                    "status": str(item.get("status", "")),
+                }
+            )
+    return slots
+
+
+def filter_slots(slots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    available = [slot for slot in slots if slot["count"] > 0]
+    if INTERESTING_VENUES:
+        available = [slot for slot in available if slot["venue"] in INTERESTING_VENUES]
+    if INTERESTING_HOURS:
+        available = [slot for slot in available if slot["time"] in INTERESTING_HOURS]
+    return available
+
+
+def _prepare_monitoring_tasks_core(
+    target_configs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    tasks: list[dict[str, Any]] = []
+    errors: list[str] = []
     today = _today_str()
     cache = load_date_id_cache()
-
-    cache_changed = False
-
-    cache.setdefault("by_venue", {})
-
-    if refresh_all:
-        # Informational only: actual refresh decision is per-venue via refreshed_date.
-        print(f"--- Ensuring dateId cache is up-to-date per venue for {today}. ---")
-
-    def _cache_snapshot_for(cfg: Dict[str, Any]) -> Tuple[Any, Any, Any]:
-        venue_id = cfg.get("venueId")
-        entry = cache.get("by_venue", {}).get(venue_id, {}) if venue_id else {}
-        return (entry.get("fieldType"), entry.get("refreshed_date"), entry.get("date_id_map"))
+    changed = False
 
     for cfg in target_configs:
         try:
-            print(f"--- Preparing: {cfg['name']} ---")
-            field_type = cfg["fieldType"]
-            print(f"  Using configured fieldType: {field_type}")
-
-            before = _cache_snapshot_for(cfg)
+            key = _cache_key(cfg["venueId"], cfg["fieldType"])
+            before = cache["by_target"].get(key)
             date_id_map = get_or_refresh_date_id_map(cfg, cache, today)
-            after = _cache_snapshot_for(cfg)
-            if after != before:
-                cache_changed = True
-
+            changed |= cache["by_target"].get(key) != before
             if not date_id_map:
-                print(f"  Could not fetch any dates for {cfg['name']}")
+                errors.append(f"{cfg['name']}: no dates returned; will retry")
                 continue
-
-            print(f"  Found {len(date_id_map)} dates to check for {cfg['name']}.")
-
             for target_date, date_id in date_id_map.items():
-                payload = build_field_situation_payload(cfg["venueId"], cfg["fieldType"], target_date, date_id)
-                task = {
-                    "top_venue_name": cfg["name"],
-                    "top_venue_id": cfg["venueId"],
-                    "target_date": target_date,
-                    "payload": payload,
-                }
-                all_tasks.append(task)
-        except Exception as e:
-            print(f"  Failed to prepare tasks for {cfg['name']}: {e}")
+                tasks.append(
+                    {
+                        "key": f"{key}|{target_date}",
+                        "top_venue_name": cfg["name"],
+                        "top_venue_id": cfg["venueId"],
+                        "target_date": target_date,
+                        "payload": build_field_situation_payload(
+                            cfg["venueId"], cfg["fieldType"], target_date, date_id
+                        ),
+                    }
+                )
+        except AuthenticationError:
+            raise
+        except Exception as exc:
+            errors.append(f"{cfg.get('name', 'Unknown venue')}: {exc}")
 
-    # Cache write behavior:
-    # - refresh_all: write at least once per day (for cache_date/metadata), and also whenever venue entries changed
-    # - refresh subset: only write when a venue entry changed
-    if refresh_all:
+    if changed:
         try:
-            cache["cache_date"] = today
-            cache["last_written_at"] = datetime.now().isoformat(timespec="seconds")
             save_date_id_cache(cache)
-            print(f"--- Wrote dateId cache: {DATE_ID_CACHE_PATH} ---")
-        except Exception as e:
-            print(f"[{datetime.now()}] Warning: failed to write dateId cache: {e}")
+        except OSError as exc:
+            errors.append(f"Could not save dateId cache: {exc}")
+    return tasks, errors
+
+
+def prepare_monitoring_tasks() -> list[dict[str, Any]]:
+    return _prepare_monitoring_tasks_core(TARGET_CONFIGS)[0]
+
+
+def prepare_monitoring_tasks_for(target_configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return _prepare_monitoring_tasks_core(target_configs)[0]
+
+
+def _slot_key(slot: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(slot["top_venue_id"]),
+        str(slot["venue_id"] or slot["venue"]),
+        str(slot["date"]),
+        str(slot["time"]),
+    )
+
+
+def _record_available_slots(
+    task_key: str,
+    available: list[dict[str, Any]],
+    known_available: dict[str, dict[tuple[str, str, str, str], int]],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Remember successful checks; failures leave the last known state intact."""
+    current = {_slot_key(slot): slot["count"] for slot in available}
+    previous = known_available.get(task_key)
+    new_slots = [slot for slot in available if _slot_key(slot) not in (previous or {})]
+    changed = previous != current and (previous is not None or bool(current))
+    known_available[task_key] = current
+    return new_slots, changed
+
+
+def _clear_screen() -> None:
+    print("\033[2J\033[H", end="")
+
+
+def _terminal_bell() -> None:
+    print("\a", end="", flush=True)
+
+
+def _render_status_panel(
+    *,
+    cycle_no: int,
+    total_checks: int,
+    tasks: list[dict[str, Any]],
+    results: dict[str, dict[str, Any]],
+    current_check: str | None,
+    last_change_at: datetime | None,
+    sleep_left: int | None,
+    recent_errors: list[str],
+    preparation_errors: list[str],
+    alert_banner: str | None,
+) -> None:
+    _clear_screen()
+    now = datetime.now()
+    counts = {status: 0 for status in ("pending", "available", "unavailable", "error")}
+    for result in results.values():
+        counts[result["status"]] += 1
+
+    print(f"SJTU Venue Monitor | {now:%Y-%m-%d %H:%M:%S} | cycle {cycle_no} | checks {total_checks}")
+    print("=" * 78)
+    print(
+        f"Pending {counts['pending']}  Available {counts['available']}  "
+        f"No availability {counts['unavailable']}  Failed {counts['error']}"
+    )
+    print(f"Checking: {current_check or '(idle)'}")
+    print(f"Last confirmed availability change: {last_change_at:%Y-%m-%d %H:%M:%S}" if last_change_at else "Last confirmed availability change: (none)")
+    print(f"Next scan after: {sleep_left}s idle" if sleep_left is not None else "Next scan after: (running)")
+
+    if alert_banner:
+        print(f"\n\033[1;7m {alert_banner} \033[0m")
+
+    available = [slot for result in results.values() for slot in result["slots"]]
+    print("\nAVAILABLE SLOTS")
+    print("---------------")
+    if available:
+        for slot in sorted(available, key=lambda item: (item["date"], item["time"], item["top_venue_name"], item["venue"]))[:30]:
+            print(
+                f"- {slot['top_venue_name']} / {slot['venue']} | {slot['date']} "
+                f"{slot['time']} | {slot['count']} left | checked {slot['checked_at']}"
+            )
+        if len(available) > 30:
+            print(f"... and {len(available) - 30} more available slots")
+    elif counts["pending"]:
+        print(f"No availability confirmed yet; {counts['pending']} checks pending.")
+    elif counts["error"] or preparation_errors:
+        print("No availability confirmed; some checks or date preparations failed (result unknown).")
     else:
-        if cache_changed:
-            try:
-                cache["last_written_at"] = datetime.now().isoformat(timespec="seconds")
-                save_date_id_cache(cache)
-                print(f"--- Wrote dateId cache: {DATE_ID_CACHE_PATH} ---")
-            except Exception as e:
-                print(f"[{datetime.now()}] Warning: failed to write dateId cache: {e}")
+        print("None: all checks completed successfully.")
 
-    print(f"--- Preparation complete. Found {len(all_tasks)} total date/venue combinations to monitor. ---")
-    return all_tasks
+    print("\nCHECK STATUS (priority order; first 15)")
+    print("---------------------------------------")
+    if not tasks:
+        print("No tasks prepared; retrying after the idle interval.")
+    priority = {"error": 0, "available": 1, "pending": 2, "unavailable": 3}
+    ordered = sorted(tasks, key=lambda task: priority[results[task["key"]]["status"]])
+    for task in ordered[:15]:
+        result = results[task["key"]]
+        detail = f" | {result['detail']}" if result["detail"] else ""
+        checked = f" | checked {result['checked_at']}" if result["checked_at"] else ""
+        print(f"- {result['status'].upper():11} {task['top_venue_name']} | {task['target_date']}{checked}{detail}")
+    if len(ordered) > 15:
+        print(f"... {len(ordered) - 15} more; see summary above")
+
+    if preparation_errors:
+        print("\nPREPARATION FAILED (will retry)")
+        for error in preparation_errors[:5]:
+            print(f"- {error}")
+        if len(preparation_errors) > 5:
+            print(f"... and {len(preparation_errors) - 5} more")
+    if recent_errors:
+        print("\nRECENT ERRORS (history)")
+        for error in recent_errors[-5:]:
+            print(f"- {error}")
 
 
-# ========= 7. MAIN LOOP =========
+def _new_results(tasks: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        task["key"]: {"status": "pending", "slots": [], "checked_at": None, "detail": ""}
+        for task in tasks
+    }
 
-def main_loop(target_configs: List[Dict[str, Any]] | None = None):
-    cycle_no = 0
 
-    # Prepare all tasks once at the start.
-    monitoring_tasks = prepare_monitoring_tasks() if target_configs is None else prepare_monitoring_tasks_for(target_configs)
-    if not monitoring_tasks:
-        # With the TUI, we still surface this via stdout because we cannot render a panel without tasks.
+def _fetch_available_slots(task: dict[str, Any]) -> list[dict[str, Any]]:
+    response = fetch_raw_response(task["payload"])
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "json" not in content_type:
+        raise ValueError(f"Unexpected Content-Type: {content_type or '(missing)'}")
+    slots = filter_slots(parse_slots_from_json(response.json()))
+    checked_at = datetime.now().strftime("%H:%M:%S")
+    for slot in slots:
+        slot.update(
+            top_venue_name=task["top_venue_name"],
+            top_venue_id=task["top_venue_id"],
+            date=task["target_date"],
+            checked_at=checked_at,
+        )
+    return slots
+
+
+def main_loop(target_configs: list[dict[str, Any]] | None = None) -> None:
+    targets = TARGET_CONFIGS if target_configs is None else target_configs
+    if not targets:
         print("No tasks to monitor. Exiting.")
         return
+    if not COOKIES:
+        raise SystemExit("No cookie configured. Fill in cookie_header in cookies.json.")
 
-    # TUI state
-    available_now: List[Dict[str, Any]] = []
-    last_avail_sig: Tuple[Tuple[str, str, str, str], ...] = tuple()
+    tasks: list[dict[str, Any]] = []
+    preparation_errors: list[str] = []
+    prepared_day: str | None = None
+    known_available: dict[str, dict[tuple[str, str, str, str], int]] = {}
     last_change_at: datetime | None = None
-
-    # Persistent error log across refreshes
-    error_lines: List[str] = []
-
-    # Alert state (used for terminal bell +高亮提示)
-    alert_until_ts: float = 0.0
-    last_alert_sig: Tuple[Tuple[str, str, str, str], ...] = tuple()
-
-    def _maybe_alert(current_available: List[Dict[str, Any]]) -> None:
-        """Best-effort immediate alert when we first observe availability."""
-        nonlocal alert_until_ts, last_alert_sig
-        if not current_available:
-            return
-        sig = _availability_signature(current_available)
-        if sig == last_alert_sig:
-            return
-        last_alert_sig = sig
-        alert_until_ts = time.time() + 25
-        _terminal_bell(repeat=2)
+    recent_errors: list[str] = []
+    total_checks = 0
+    cycle_no = 0
 
     while True:
+        today = _today_str()
+        if prepared_day != today or preparation_errors:
+            try:
+                tasks, preparation_errors = _prepare_monitoring_tasks_core(targets)
+            except AuthenticationError as exc:
+                raise SystemExit(_login_error_message(exc)) from None
+            prepared_day = today
+            current_keys = {task["key"] for task in tasks}
+            known_available = {
+                key: value for key, value in known_available.items() if key in current_keys
+            }
+
         cycle_no += 1
-        cycle_started_at = datetime.now()
+        results = _new_results(tasks)
+        alert_until = 0.0
+        alert_banner: str | None = None
 
-        # 每轮开始时清空上一轮的即时可用列表
-        # 并且重置 alert 状态，这样只要在这一轮里再次检测到可用场地，
-        # 就会再次触发终端铃声和高亮提示。
-        available_now = []
-        last_avail_sig = tuple()
-        alert_until_ts = 0.0
-        last_alert_sig = tuple()
-
-        # Track a panel message for outer-loop failures
-        outer_recent_lines: List[str] | None = None
-
-        try:
-            all_slots_for_cycle: List[Dict[str, Any]] = []
-
-            banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
+        def render(current_check: str | None = None, sleep_left: int | None = None) -> None:
             _render_status_panel(
-                cycle_started_at=cycle_started_at,
                 cycle_no=cycle_no,
-                total_checks=len(monitoring_tasks),
-                current_check=None,
-                available_now=available_now,
+                total_checks=total_checks,
+                tasks=tasks,
+                results=results,
+                current_check=current_check,
                 last_change_at=last_change_at,
-                sleep_left=None,
-                recent_lines=None,
-                error_lines=error_lines,
-                alert_banner=banner,
+                sleep_left=sleep_left,
+                recent_errors=recent_errors,
+                preparation_errors=preparation_errors,
+                alert_banner=alert_banner if time.time() < alert_until else None,
             )
 
-            for idx, task in enumerate(monitoring_tasks, start=1):
-                recent_lines: List[str] = []
-                current_label = f"{idx}/{len(monitoring_tasks)} {task['top_venue_name']} on {task['target_date']}"
+        render()
+        for index, task in enumerate(tasks, start=1):
+            label = f"{index}/{len(tasks)} {task['top_venue_name']} | {task['target_date']}"
+            render(current_check=label)
+            total_checks += 1
+            try:
+                available = _fetch_available_slots(task)
+                new_slots, changed = _record_available_slots(
+                    task["key"], available, known_available
+                )
+                if changed:
+                    last_change_at = datetime.now()
+                if new_slots:
+                    _terminal_bell()
+                    alert_banner = f"NEW AVAILABILITY: {len(new_slots)} slot(s) | {task['top_venue_name']} | {task['target_date']}"
+                    alert_until = time.time() + 25
+                results[task["key"]] = {
+                    "status": "available" if available else "unavailable",
+                    "slots": available,
+                    "checked_at": datetime.now().strftime("%H:%M:%S"),
+                    "detail": f"{len(available)} slot(s)" if available else "",
+                }
+            except AuthenticationError as exc:
+                raise SystemExit(_login_error_message(exc)) from None
+            except Exception as exc:
+                message = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {label}: {exc}"
+                recent_errors.append(message)
+                del recent_errors[:-100]
+                results[task["key"]] = {
+                    "status": "error", "slots": [],
+                    "checked_at": datetime.now().strftime("%H:%M:%S"), "detail": str(exc)
+                }
+            render(current_check=label)
+            time.sleep(CHECK_INTERVAL)
 
-                try:
-                    recent_lines.append(f"[{datetime.now():%H:%M:%S}] Fetching...")
-
-                    banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
-                    _render_status_panel(
-                        cycle_started_at=cycle_started_at,
-                        cycle_no=cycle_no,
-                        total_checks=len(monitoring_tasks),
-                        current_check=current_label,
-                        available_now=available_now,
-                        last_change_at=last_change_at,
-                        sleep_left=None,
-                        recent_lines=recent_lines,
-                        error_lines=error_lines,
-                        alert_banner=banner,
-                    )
-
-                    resp = fetch_raw_response(task["payload"])
-
-                    content_type = resp.headers.get("Content-Type", "")
-                    if "application/json" in content_type:
-                        data = resp.json()
-
-                        # Persist server-side error codes/messages in the TUI.
-                        # E.g. {"code": 500, "msg": "每日请求超过限制，无法获取", ...}
-                        server_code = data.get("code")
-                        if server_code is not None and server_code != 0:
-                            msg = (
-                                f"[{datetime.now():%H:%M:%S}] Server error: code={server_code} "
-                                f"msg={data.get('msg') or ''} msgEn={data.get('msgEn') or ''}"
-                            ).strip()
-                            recent_lines.append(msg)
-                            error_lines.append(msg)
-                            if len(error_lines) > 100:
-                                del error_lines[:-100]
-
-                        slots = parse_slots_from_json(data)
-
-                        for s in slots:
-                            s["top_venue_name"] = task["top_venue_name"]
-                            s["top_venue_id"] = task["top_venue_id"]
-                            s["date"] = task["target_date"]
-
-                        all_slots_for_cycle.extend(slots)
-
-                        avail_for_task = filter_slots(slots)
-                        if avail_for_task:
-                            # Only show court + date (no venue/time details)
-                            recent_lines.append(
-                                f"[{datetime.now():%H:%M:%S}] Available: {task['top_venue_name']} | {task['target_date']}"
-                            )
-
-                            # Update AVAILABLE NOW immediately
-                            available_now.extend(avail_for_task)
-                            sig_now = _availability_signature(available_now)
-                            if sig_now != last_avail_sig:
-                                last_avail_sig = sig_now
-                                last_change_at = datetime.now()
-
-                            # Immediate alert as soon as we observe availability (no need to wait for full cycle).
-                            _maybe_alert(available_now)
-
-                        else:
-                            recent_lines.append(f"[{datetime.now():%H:%M:%S}] No availability.")
-                    else:
-                        msg = f"[{datetime.now():%H:%M:%S}] Unexpected Content-Type: {content_type}"
-                        recent_lines.append(msg)
-                        error_lines.append(msg)
-                        if len(error_lines) > 100:
-                            del error_lines[:-100]
-
-                    banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
-                    _render_status_panel(
-                        cycle_started_at=cycle_started_at,
-                        cycle_no=cycle_no,
-                        total_checks=len(monitoring_tasks),
-                        current_check=current_label,
-                        available_now=available_now,
-                        last_change_at=last_change_at,
-                        sleep_left=None,
-                        recent_lines=recent_lines,
-                        error_lines=error_lines,
-                        alert_banner=banner,
-                    )
-
-                    time.sleep(CHECK_INTERVAL)
-
-                except Exception as e:
-                    msg = f"[{datetime.now():%H:%M:%S}] Error: {e}"
-                    recent_lines.append(msg)
-                    error_lines.append(msg)
-                    if len(error_lines) > 100:
-                        del error_lines[:-100]
-                    banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
-                    _render_status_panel(
-                        cycle_started_at=cycle_started_at,
-                        cycle_no=cycle_no,
-                        total_checks=len(monitoring_tasks),
-                        current_check=current_label,
-                        available_now=available_now,
-                        last_change_at=last_change_at,
-                        sleep_left=None,
-                        recent_lines=recent_lines,
-                        error_lines=error_lines,
-                        alert_banner=banner,
-                    )
-                    time.sleep(1)
-
-            # End-of-cycle aggregation still updates the panel state,
-            # but alerts would have already been triggered above.
-            now_available = filter_slots(all_slots_for_cycle)
-            sig = _availability_signature(now_available)
-
-            if sig != last_avail_sig:
-                last_avail_sig = sig
-                available_now = now_available
-                last_change_at = datetime.now()
-
-        except Exception as e:
-            msg = f"[{datetime.now():%H:%M:%S}] Cycle error: {e}"
-            outer_recent_lines = [msg]
-            error_lines.append(msg)
-            if len(error_lines) > 100:
-                del error_lines[:-100]
-            banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
-            _render_status_panel(
-                cycle_started_at=cycle_started_at,
-                cycle_no=cycle_no,
-                total_checks=len(monitoring_tasks),
-                current_check=None,
-                available_now=available_now,
-                last_change_at=last_change_at,
-                sleep_left=None,
-                recent_lines=outer_recent_lines,
-                error_lines=error_lines,
-                alert_banner=banner,
-            )
-            time.sleep(1)
-
-        # 在等待下一次轮询时，为了减少后台占用，我们不再每秒刷新 TUI，
-        # 而是渲染一次状态面板然后整体 sleep POLL_INTERVAL 秒。
-        banner = _build_alert_banner(available_now) if (available_now and time.time() < alert_until_ts) else None
-        _render_status_panel(
-            cycle_started_at=cycle_started_at,
-            cycle_no=cycle_no,
-            total_checks=len(monitoring_tasks),
-            current_check=None,
-            available_now=available_now,
-            last_change_at=last_change_at,
-            sleep_left=POLL_INTERVAL,
-            recent_lines=outer_recent_lines,
-            error_lines=error_lines,
-            alert_banner=banner,
-        )
+        render(sleep_left=POLL_INTERVAL)
         time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
-    main_loop()
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        print("\n监控已停止。")

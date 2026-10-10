@@ -2,12 +2,15 @@
 
 这是一个 Python 小工具，用于轮询 SJTU 体育场馆的场地余量，并在终端里以**自动刷新**的仪表盘形式展示。
 
+想直接在已登录的预约页面中点击选择场馆和日期？使用[油猴脚本及安装说明](USERSCRIPT.zh-CN.md)，无需复制 Cookie 到 `cookies.json`。
+
 ## 功能
 
 - 终端自动刷新 UI（基本不滚屏）
 - 循环监控多个场馆/日期组合
-- 使用 `date_id_cache.json` 缓存 `dateId` 映射，减少每天重复请求
-- 发现余量时的提醒：
+- 按场馆和场地类型缓存每日 `dateId` 映射，跨日运行时自动刷新日期
+- 区分待检查、有余量、无余量和检查失败，展示具体场地、时段、余量及查询时间
+- 新出现可用时段时的提醒：
   - 终端响铃（`\a`，取决于终端是否启用 bell）
   - UI 内高亮横幅提示
 
@@ -25,14 +28,19 @@ pip install requests
 
 ## 配置
 
-1. 在 `config.py` 中配置监控目标和请求所需信息：
+1. 在 `config.py` 中配置 `TARGET_CONFIGS` 场馆列表；如有需要，也可调整 `HEADERS`。
 
-- `TARGET_CONFIGS`：你要监控的场馆列表
-- `HEADERS` / `COOKIES`：用于访问 SJTU Sports 接口的请求头/登录态
+2. 编辑项目目录中的 `cookies.json`，把浏览器里成功的场地接口请求的 Request Headers 中的**整段 Cookie**粘贴到 `cookie_header`：
 
-2. （可选）在 `monitor.py` 中调整轮询间隔：
+```json
+{
+  "cookie_header": "cookie名=实际值; 另一个cookie名=实际值"
+}
+```
 
-- `POLL_INTERVAL`（单位：秒）
+不需要单独识别某个 Cookie 名称。`cookies.json` 优先于旧环境变量，且已被 `.gitignore` 忽略，不会被普通 Git 提交。保留 JSON 的双引号；只替换引号内的 Cookie 内容。
+
+3. （可选）在 `monitor.py` 中调整 `POLL_INTERVAL`（一整轮完成后的等待秒数）和 `CHECK_INTERVAL`（相邻请求间隔）。实际两轮间隔还包括请求耗时。
 
 ## 使用方法
 
@@ -41,17 +49,6 @@ pip install requests
 ```bash
 python main.py
 ```
-
-## Tampermonkey 版本（无需手动复制 cookie）
-
-如果你更希望在浏览器里长期挂着监控，并自动复用当前登录态，可导入 `sjtu_venue_monitor.user.js`。
-
-1. 浏览器安装 Tampermonkey。
-2. 新建脚本并粘贴 `sjtu_venue_monitor.user.js` 内容（或直接导入）。
-3. 打开并保持任意 `https://sports.sjtu.edu.cn/*` 页面处于登录状态。
-4. 脚本会在页面内轮询，显示悬浮面板，并在余量变化时提醒。
-
-可直接在 userscript 内调整 `TARGET_CONFIGS`、`POLL_INTERVAL_MS`、`INTERESTING_VENUES`、`INTERESTING_HOURS`。
 
 ### 按场地类型过滤
 
@@ -77,28 +74,33 @@ python main.py --tennis --gym
 
 - 当前时间、循环次数（cycle）、总检查数（checks）
 - 当前正在检查的任务（场馆 + 日期）
-- **AVAILABLE NOW (court + date)**：当前检测到的可用场馆（去重）
-- **TASK OUTPUT**：当前任务的最近状态信息
+- **AVAILABLE SLOTS**：本轮已确认的具体场地、日期、时段、余量和查询时间
+- **CHECK STATUS**：待检查、有余量、无余量和失败的数量及任务状态
+- **PREPARATION FAILED / RECENT ERRORS**：日期准备失败和历史错误
 
 当发现有余量时，会：
 
-- 尝试触发终端响铃（如果你的终端启用了 bell）
-- 在 UI 顶部显示高亮横幅，并展示前几条 `(场馆 | 日期)`
+- 只在发现新出现的可用时段时尝试响铃，不会因同一余量持续存在而每轮重复提醒
+- 在 UI 顶部显示高亮横幅
 
 ## 文件说明
 
 - `main.py`：命令行入口与目标选择
 - `monitor.py`：轮询逻辑 + 终端 UI
-- `config.py`：监控目标、headers/cookies
-- `date_id_cache.json`：程序自动生成/更新的每日缓存
-- `sjtu_venue_monitor.user.js`：Tampermonkey userscript 版本（基于浏览器登录态，无需手动复制 cookie）
+- `config.py`：监控目标、请求头、读取本地 Cookie 文件
+- `cookies.json`：本地 Cookie 配置（请勿分享或提交）
+- `date_id_cache.json`：程序自动生成/更新的本地缓存，已从 Git 跟踪中移除
+- `fresh_date_ids.py`：强制刷新所有配置场馆的日期 ID（`python fresh_date_ids.py`）
+- `sjtu-venue-monitor.user.js`：浏览器油猴脚本；见[安装说明](USERSCRIPT.zh-CN.md)
+- `tests/test_monitor.py`：不访问网络的回归测试（`python -m unittest discover -s tests`）
 
 ## 常见问题
 
 - **没有响铃？**
   - 很多终端默认禁用了 bell，需要在终端设置里开启。
 - **请求失败 / 一直没有结果？**
-  - 优先检查 `config.py` 中的 `HEADERS` / `COOKIES` 是否有效。
+  - 优先检查环境变量中的登录态，再看界面的失败状态和错误详情。
+  - 如果提示 `API error 401`，请重新登录，在浏览器开发者工具的 Network 中查看 `sports.sjtu.edu.cn` 场地接口请求实际发送的整段 Cookie。你提供的两个 `_ga` Cookie 已被接口拒绝；更新 `cookies.json` 后重新启动程序。
 - **太频繁/太慢？**
   - 调整 `POLL_INTERVAL`，或减少 `TARGET_CONFIGS` 的数量。
 
