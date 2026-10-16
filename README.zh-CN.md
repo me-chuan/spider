@@ -4,6 +4,8 @@
 
 想直接在已登录的预约页面中点击选择场馆和日期？使用[油猴脚本及安装说明](USERSCRIPT.zh-CN.md)，无需复制 Cookie 到 `cookies.json`。
 
+想按日期范围查询羽毛球、健身房、网球余量、持续监控并手动下单？使用[查询、监控与手动下单脚本](MANUAL_BOOKING.zh-CN.md)。中午 12:00 的自动抢场使用独立的[定时抢场脚本](NOON_BOOKING.zh-CN.md)。
+
 ## 功能
 
 - 终端自动刷新 UI（基本不滚屏）
@@ -92,6 +94,8 @@ python main.py --tennis --gym
 - `date_id_cache.json`：程序自动生成/更新的本地缓存，已从 Git 跟踪中移除
 - `fresh_date_ids.py`：强制刷新所有配置场馆的日期 ID（`python fresh_date_ids.py`）
 - `sjtu-venue-monitor.user.js`：浏览器油猴脚本；见[安装说明](USERSCRIPT.zh-CN.md)
+- `sjtu-manual-booking.user.js`：按日期范围查询、持续监控与手动下单；见[安装说明](MANUAL_BOOKING.zh-CN.md)
+- `sjtu-noon-booking.user.js`：12:00 定时抢场；见[安装说明](NOON_BOOKING.zh-CN.md)
 - `tests/test_monitor.py`：不访问网络的回归测试（`python -m unittest discover -s tests`）
 
 ## 常见问题
